@@ -21,7 +21,8 @@ const pool = mysql.createPool({
   host: "localhost",
   user: "root",
   password: "",
-  database: "buyer-seller",
+  database: "seller_buyer_dummy",
+  // database: "buyer-seller",
   waitForConnections: true,
   connectionLimit: 20,
 });
