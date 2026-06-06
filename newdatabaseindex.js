@@ -6,6 +6,7 @@ const Bull = require('bull');
 const { createBullBoard } = require('@bull-board/api');
 const { BullAdapter } = require('@bull-board/api/bullAdapter');
 const { ExpressAdapter } = require('@bull-board/express');
+const { checkForReplies } = require('./readReplies');
 require('dotenv').config();
 
 const app = express();
@@ -55,15 +56,28 @@ const transporter = nodemailer.createTransport({
   tls: { rejectUnauthorized: false },
 });
 
-function buildHtml(message, product) {
+function buildHtml(message, product, interestedUrl, notInterestedUrl) {
   return `
     <!DOCTYPE html><html><head><style>
-      body{font-family:Arial,sans-serif;line-height:1.6;color:#333}
-      .container{max-width:600px;margin:0 auto;padding:20px}
-      .header{background-color:#4F46E5;color:white;padding:20px;text-align:center}
-      .content{padding:20px;background-color:#f9fafb}
-      .footer{padding:20px;text-align:center;font-size:12px;color:#6b7280}
-      .product{font-weight:bold;color:#4F46E5}
+      body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+      .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+      .header { background-color: #4F46E5; color: white; padding: 20px; text-align: center; }
+      .content { padding: 20px; background-color: #f9fafb; }
+      .footer { padding: 20px; text-align: center; font-size: 12px; color: #6b7280; }
+      .product { font-weight: bold; color: #4F46E5; }
+      .btn-row { margin-top: 24px; }
+      .btn {
+        display: inline-block;
+        padding: 12px 28px;
+        border-radius: 6px;
+        text-decoration: none;
+        font-weight: bold;
+        font-size: 15px;
+        margin-right: 12px;
+      }
+      .btn-yes { background-color: #22c55e; color: white; }
+      .btn-no  { background-color: #ef4444; color: white; }
+      .note { font-size: 12px; color: #9ca3af; margin-top: 16px; }
     </style></head><body>
       <div class="container">
         <div class="header"><h2>Business Opportunity</h2></div>
@@ -71,6 +85,16 @@ function buildHtml(message, product) {
           ${message.replace(/\n/g, '<br/>')}
           <br/><br/>
           <p>Product/Service: <span class="product">${product}</span></p>
+
+          <!-- ✅ Tracking Buttons -->
+          <p><strong>Are you interested in this product?</strong></p>
+          <div class="btn-row">
+            <a href="${interestedUrl}" class="btn btn-yes">✅ Interested</a>
+            <a href="${notInterestedUrl}" class="btn btn-no">❌ Not Interested</a>
+          </div>
+          <p class="note">Clicking a button records your response. You can only respond once.</p>
+
+          <br/>
           <p>Best regards,<br/>Trade Platform Team</p>
         </div>
         <div class="footer">
@@ -80,6 +104,10 @@ function buildHtml(message, product) {
     </body></html>
   `;
 }
+
+
+
+
 
 async function dbInsertCompanyRow(batchId, company, status) {
   await pool.query(
@@ -98,9 +126,6 @@ async function dbInsertCompanyRow(batchId, company, status) {
     ]
   );
 }
-/* ─────────────────────────────────────────────
-   WORKER
-───────────────────────────────────────────── */
 emailQueue.process(async (job) => {
   const {
     recipientEmail,
@@ -112,27 +137,25 @@ emailQueue.process(async (job) => {
   } = job.data;
 
   console.log(`Processing job for ${recipientEmail} in batch ${batchId}`);
-
   await job.progress(20);
 
   const trackedSubject = `${subject || `Business Opportunity - ${product}`} [BATCH:${batchId}]`;
 
-  // Ensure parent record exists before proceeding
+  // ✅ Lookup parent by batch_id
+  let historyRowId = null;
   try {
-    const [parentCheck] = await pool.query(
-      'SELECT id FROM email_history WHERE id = ?',
+    const [parentRows] = await pool.query(
+      'SELECT id FROM email_history WHERE batch_id = ?',
       [batchId]
     );
-    
-    if (parentCheck.length === 0) {
-      console.log(`Parent record ${batchId} not found, creating now...`);
-      await pool.query(
-        'INSERT IGNORE INTO email_history (id, product, date) VALUES (?, ?, ?)',
-        [batchId, product, new Date()]
-      );
+    if (parentRows.length > 0) {
+      historyRowId = parentRows[0].id;
+      console.log(`✅ Found parent record id: ${historyRowId} for batchId: ${batchId}`);
+    } else {
+      console.warn(`⚠️ No parent record found for batchId: ${batchId}`);
     }
   } catch (err) {
-    console.error(`Error checking/creating parent record: ${err.message}`);
+    console.error(`Error looking up parent record: ${err.message}`);
   }
 
   let sendStatus = 'Sent';
@@ -140,11 +163,15 @@ emailQueue.process(async (job) => {
   let messageId = null;
 
   try {
+    const BASE_URL = process.env.BASE_URL;
+    const interestedUrl    = `${BASE_URL}/track-response?batchId=${batchId}&email=${encodeURIComponent(recipientEmail)}&response=interested`;
+    const notInterestedUrl = `${BASE_URL}/track-response?batchId=${batchId}&email=${encodeURIComponent(recipientEmail)}&response=not_interested`;
+
     const info = await transporter.sendMail({
       from: `"Trade Platform" <${process.env.EMAIL_USER}>`,
       to: recipientEmail,
       subject: trackedSubject,
-      html: buildHtml(message, product),
+      html: buildHtml(message, product, interestedUrl, notInterestedUrl),
       headers: {
         'X-Batch-ID': batchId,
         'X-Product': product,
@@ -163,32 +190,30 @@ emailQueue.process(async (job) => {
     await job.progress(70);
   }
 
-  // Now insert/update the company record
+  // ✅ Insert/Update company record using historyRowId
   try {
-    // Check if record already exists
     const [existing] = await pool.query(
       `SELECT id FROM email_history_companies 
        WHERE history_id = ? AND email = ?`,
-      [batchId, recipientEmail]
+      [historyRowId, recipientEmail]
     );
-    
+
     if (existing.length > 0) {
-      // Update existing
       await pool.query(
         `UPDATE email_history_companies 
          SET sent_at = ?, status = ?, template_used = ?
          WHERE history_id = ? AND email = ?`,
-        [new Date(), sendStatus, company.templateUsed || 'Welcome Template', batchId, recipientEmail]
+        [new Date(), sendStatus, company.templateUsed || 'Welcome Template', historyRowId, recipientEmail]
       );
-      console.log(`📝 Updated record for ${recipientEmail} with status: ${sendStatus}`);
+      console.log(`📝 Updated record for ${recipientEmail}`);
     } else {
-      // Insert new
       await pool.query(
         `INSERT INTO email_history_companies
-          (history_id, company_name, country, contact_name, email, sent_at, status, template_used)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          (history_id, batch_id, company_name, country, contact_name, email, sent_at, status, template_used, response, responded_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)`,
         [
-          batchId,
+          historyRowId,
+          batchId,                                        // ✅ store batch_id too
           company.companyName || 'Unknown',
           company.country || null,
           company.contactName || company.companyName || 'Unknown',
@@ -198,17 +223,15 @@ emailQueue.process(async (job) => {
           company.templateUsed || 'Welcome Template',
         ]
       );
-      console.log(`📝 Inserted new record for ${recipientEmail} with status: ${sendStatus}`);
+      console.log(`📝 Inserted record for ${recipientEmail}`);
     }
+
     await job.progress(100);
   } catch (dbErr) {
     console.error(`💾 Database error for ${recipientEmail}:`, dbErr.message);
-    // Don't throw here, we still want to mark the job as failed if email failed
   }
 
-  if (sendError) {
-    throw sendError;
-  }
+  if (sendError) throw sendError;
 
   return { recipientEmail, status: sendStatus, messageId };
 });
@@ -218,10 +241,119 @@ emailQueue.on('completed', (job, result) => {
 emailQueue.on('failed', (job, err) => {
   console.error(`Job ${job.id} failed — ${job.data.recipientEmail}: ${err.message}`);
 });
+app.post('/send-email', async (req, res) => {
+  const { product, subject, message, historyPayload } = req.body;
+  console.log('Received /send-email request with payload:', req.body);
 
-/* ─────────────────────────────────────────────
-   GET BUYERS
-───────────────────────────────────────────── */
+  if (!historyPayload) {
+    return res.status(400).json({ error: 'historyPayload is required' });
+  }
+
+  const { id: batchId, date: batchDate, companies } = historyPayload;
+
+  if (!batchId) {
+    return res.status(400).json({ error: 'historyPayload.id (batchId) is required' });
+  }
+
+  if (!companies || companies.length === 0) {
+    return res.status(400).json({ error: 'No recipients specified' });
+  }
+
+  try {
+    // ✅ Insert with batch_id column (no duplicate due to UNIQUE)
+    await pool.query(
+      'INSERT IGNORE INTO email_history (batch_id, product, date) VALUES (?, ?, ?)',
+      [batchId, product, batchDate]
+    );
+
+    console.log(`✅ Parent record created for batchId: ${batchId}`);
+
+    const jobs = await Promise.all(
+      companies.map((company, index) =>
+        emailQueue.add(
+          {
+            recipientEmail: company.email,
+            subject,
+            message,
+            product,
+            company,
+            batchId,
+          },
+          {
+            attempts: 3,
+            backoff: { type: 'exponential', delay: 3000 },
+            removeOnComplete: false,
+            removeOnFail: false,
+            jobId: `${batchId}-${index}`,
+          }
+        )
+      )
+    );
+
+    const jobIds = jobs.map((j) => j.id.toString());
+    console.log(`Enqueued ${jobIds.length} jobs for batch ${batchId}`);
+    res.json({ batchId, jobIds, total: jobIds.length });
+
+  } catch (err) {
+    console.error('Queue error:', err);
+    res.status(500).json({ error: 'Failed to enqueue jobs', details: err.message });
+  }
+});
+app.get('/batch-status/:batchId', async (req, res) => {
+  const jobIdsParam = req.query.jobIds;
+  if (!jobIdsParam) {
+    return res.status(400).json({ error: 'jobIds query param required' });
+  }
+
+  const jobIds = jobIdsParam.split(',');
+
+  try {
+    const jobStatuses = await Promise.all(
+      jobIds.map(async (jobId) => {
+        const job = await emailQueue.getJob(jobId);
+        if (!job) return { jobId, state: 'not_found', progress: 0, email: null };
+
+        const state = await job.getState();
+        return {
+          jobId,
+          email: job.data.recipientEmail,
+          companyName: job.data.company?.companyName,
+          state,
+          progress: job._progress || 0,
+          result: state === 'completed' ? job.returnvalue : null,
+          reason: state === 'failed' ? job.failedReason : null,
+        };
+      })
+    );
+
+    const total = jobStatuses.length;
+    const completed = jobStatuses.filter((j) => j.state === 'completed').length;
+    const failed = jobStatuses.filter((j) => j.state === 'failed').length;
+    const active = jobStatuses.filter((j) => j.state === 'active').length;
+    const waiting = jobStatuses.filter((j) => ['waiting', 'delayed'].includes(j.state)).length;
+
+    res.json({
+      batchId: req.params.batchId,
+      total,
+      completed,
+      failed,
+      active,
+      waiting,
+      allDone: completed + failed === total,
+      overallProgress: total > 0 ? Math.round(((completed + failed) / total) * 100) : 0,
+      jobs: jobStatuses,
+    });
+
+  } catch (err) {
+    console.error('Batch status error:', err);
+    res.status(500).json({ error: 'Failed to get batch status' });
+  }
+});
+
+
+
+
+
 
 app.get("/buyers", async (req, res) => {
   try {
@@ -323,118 +455,6 @@ app.get("/filters/products", async (req, res) => {
 });
 
 /* ─────────────────────────────────────────────
-   SEND EMAIL (ENQUEUE JOBS)
-───────────────────────────────────────────── */
-
-app.post('/send-email', async (req, res) => {
-  const { product, subject, message, historyPayload } = req.body;
-  console.log('Received /send-email request with payload:', req.body);
-
-  if (!historyPayload) {
-    return res.status(400).json({ error: 'historyPayload is required' });
-  }
-
-  const { id: batchId, date: batchDate, companies } = historyPayload;
-
-  if (!companies || companies.length === 0) {
-    return res.status(400).json({ error: 'No recipients specified' });
-  }
-
-  try {
-    // ✅ Create parent row BEFORE enqueuing any jobs
-    await pool.query(
-      'INSERT IGNORE INTO email_history (id, product, date) VALUES (?, ?, ?)',
-      [batchId, product, batchDate]
-    );
-
-    const jobs = await Promise.all(
-      companies.map((company, index) =>
-        emailQueue.add(
-          {
-            recipientEmail: company.email,
-            subject,
-            message,
-            product,
-            company,
-            batchId,
-          },
-          {
-            attempts: 3,
-            backoff: { type: 'exponential', delay: 3000 },
-            removeOnComplete: false,
-            removeOnFail: false,
-            jobId: `${batchId}-${index}`,
-          }
-        )
-      )
-    );
-
-    const jobIds = jobs.map((j) => j.id.toString());
-    console.log(`Enqueued ${jobIds.length} jobs for batch ${batchId}`);
-    res.json({ batchId, jobIds, total: jobIds.length });
-
-  } catch (err) {
-    console.error('Queue error:', err);
-    res.status(500).json({ error: 'Failed to enqueue jobs', details: err.message });
-  }
-});
-
-/* ─────────────────────────────────────────────
-   BATCH STATUS
-───────────────────────────────────────────── */
-
-app.get('/batch-status/:batchId', async (req, res) => {
-  const jobIdsParam = req.query.jobIds;
-  if (!jobIdsParam) {
-    return res.status(400).json({ error: 'jobIds query param required' });
-  }
-
-  const jobIds = jobIdsParam.split(',');
-
-  try {
-    const jobStatuses = await Promise.all(
-      jobIds.map(async (jobId) => {
-        const job = await emailQueue.getJob(jobId);
-        if (!job) return { jobId, state: 'not_found', progress: 0, email: null };
-
-        const state = await job.getState();
-        return {
-          jobId,
-          email: job.data.recipientEmail,
-          companyName: job.data.company?.companyName,
-          state,
-          progress: job._progress || 0,
-          result: state === 'completed' ? job.returnvalue : null,
-          reason: state === 'failed' ? job.failedReason : null,
-        };
-      })
-    );
-
-    const total = jobStatuses.length;
-    const completed = jobStatuses.filter((j) => j.state === 'completed').length;
-    const failed = jobStatuses.filter((j) => j.state === 'failed').length;
-    const active = jobStatuses.filter((j) => j.state === 'active').length;
-    const waiting = jobStatuses.filter((j) => ['waiting', 'delayed'].includes(j.state)).length;
-
-    res.json({
-      batchId: req.params.batchId,
-      total,
-      completed,
-      failed,
-      active,
-      waiting,
-      allDone: completed + failed === total,
-      overallProgress: total > 0 ? Math.round(((completed + failed) / total) * 100) : 0,
-      jobs: jobStatuses,
-    });
-
-  } catch (err) {
-    console.error('Batch status error:', err);
-    res.status(500).json({ error: 'Failed to get batch status' });
-  }
-});
-
-/* ─────────────────────────────────────────────
    EMAIL HISTORY
 ───────────────────────────────────────────── */
 
@@ -442,7 +462,7 @@ app.get('/history', async (req, res) => {
   try {
     const [results] = await pool.query(`
       SELECT h.id, h.product, h.date,
-             c.company_name,c.country, c.contact_name, c.email, c.sent_at, c.status, c.template_used
+             c.company_name,c.country, c.contact_name, c.email, c.sent_at, c.status,c.response,c.responded_at, c.template_used
       FROM email_history h
       LEFT JOIN email_history_companies c ON h.id = c.history_id
       ORDER BY h.date DESC
@@ -460,6 +480,8 @@ app.get('/history', async (req, res) => {
            country: row.country, 
           email: row.email,
           sentAt: row.sent_at,
+          response: row.response,
+          respondedAt: row.responded_at,
           status: row.status,
           templateUsed: row.template_used,
         });
@@ -474,18 +496,91 @@ app.get('/history', async (req, res) => {
   }
 });
 
+// app.get('/history/:id', async (req, res) => {
+//   try {
+//     const { id } = req.params;
+
+//     const [results] = await pool.query(`
+//       SELECT h.id, h.product, h.date,
+//              c.company_name, c.contact_name, c.email, c.sent_at, c.status,c.response,c.responded_at, c.template_used
+//       FROM email_history h
+//       LEFT JOIN email_history_companies c ON h.id = c.history_id
+//       WHERE h.id = ?
+//       ORDER BY h.date DESC
+//     `, [id]);
+
+//     if (results.length === 0) {
+//       return res.status(404).json({ error: 'Entry not found' });
+//     }
+
+//     const historyEntry = {
+//       id: results[0].id,
+//       product: results[0].product,
+//       date: results[0].date,
+//       companies: [],
+//     };
+
+//     results.forEach((row) => {
+//       if (row.company_name) {
+//         historyEntry.companies.push({
+//           companyName: row.company_name,
+//           contactName: row.contact_name,
+//           email: row.email,
+//           sentAt: row.sent_at,
+//           response: row.response,
+//           respondedAt: row.responded_at,
+//           status: row.status,
+//           templateUsed: row.template_used,
+//         });
+//       }
+//     });
+
+//     res.json(historyEntry);
+
+//   } catch (err) {
+//     console.error('GET /history/:id error:', err);
+//     res.status(500).json({ error: err.message });
+//   }
+// });
+
+
 app.get('/history/:id', async (req, res) => {
   try {
     const { id } = req.params;
 
-    const [results] = await pool.query(`
-      SELECT h.id, h.product, h.date,
-             c.company_name, c.contact_name, c.email, c.sent_at, c.status, c.template_used
+    const [results] = await pool.query(
+      `
+      SELECT
+        h.id,
+        h.product,
+        h.date,
+
+        c.company_name,
+        c.contact_name,
+        c.email,
+        c.sent_at,
+        c.status AS email_status,
+        c.response AS company_response,
+        c.responded_at AS company_responded_at,
+        c.template_used,
+
+        er.message AS reply_message,
+        er.interest,
+        er.replied_at
+
       FROM email_history h
-      LEFT JOIN email_history_companies c ON h.id = c.history_id
+
+      LEFT JOIN email_history_companies c
+        ON h.id = c.history_id
+
+      LEFT JOIN email_replies er
+        ON er.history_id = h.id
+        AND LOWER(er.from_email) = LOWER(c.email)
+
       WHERE h.id = ?
-      ORDER BY h.date DESC
-    `, [id]);
+      `,
+      [id]
+    );
 
     if (results.length === 0) {
       return res.status(404).json({ error: 'Entry not found' });
@@ -499,30 +594,34 @@ app.get('/history/:id', async (req, res) => {
     };
 
     results.forEach((row) => {
-      if (row.company_name) {
-        historyEntry.companies.push({
-          companyName: row.company_name,
-          contactName: row.contact_name,
-          email: row.email,
-          sentAt: row.sent_at,
-          status: row.status,
-          templateUsed: row.template_used,
-        });
+      let status = row.email_status || 'Sent';
+
+      if (row.interest === 'interested') {
+        status = 'Interested';
+      } else if (row.interest === 'not_interested') {
+        status = 'Not Interested';
+      } else if (row.reply_message || row.replied_at) {
+        status = 'Replied';
       }
+
+      historyEntry.companies.push({
+        companyName: row.company_name,
+        contactName: row.contact_name,
+        email: row.email,
+        sentAt: row.sent_at,
+        response: row.reply_message || row.company_response,
+        respondedAt: row.replied_at || row.company_responded_at,
+        status,
+        templateUsed: row.template_used,
+      });
     });
 
     res.json(historyEntry);
-
   } catch (err) {
     console.error('GET /history/:id error:', err);
     res.status(500).json({ error: err.message });
   }
 });
-
-/* ─────────────────────────────────────────────
-   GET REPLIES FOR A HISTORY ENTRY
-───────────────────────────────────────────── */
-
 app.get('/history/:id/replies', async (req, res) => {
   try {
     const { id } = req.params;
@@ -551,9 +650,6 @@ app.get('/history/:id/replies', async (req, res) => {
   }
 });
 
-/* ─────────────────────────────────────────────
-   EMAIL TEMPLATES
-───────────────────────────────────────────── */
 
 app.post("/email-templates", async (req, res) => {
   try {
@@ -597,9 +693,6 @@ app.delete("/email-templates/:id", async (req, res) => {
   }
 });
 
-/* ─────────────────────────────────────────────
-   REPLY HISTORY
-───────────────────────────────────────────── */
 
 app.get('/api/replyhistory', async (req, res) => {
   try {
@@ -784,9 +877,6 @@ app.get('/api/replyhistory/:id', async (req, res) => {
   }
 });
 
-
-
-
 app.get('/api/tracking/all', async (req, res) => {
   try {
     // 1. GET ALL SENT EMAILS
@@ -800,11 +890,13 @@ app.get('/api/tracking/all', async (req, res) => {
         ehc.email,
         ehc.sent_at,
         ehc.status,
+        ehc.response,
+        ehc.responded_at,
         ehc.template_used,
         eh.product as product_name,
         'sent' as type
       FROM email_history_companies ehc
-      LEFT JOIN email_history eh ON ehc.history_id = eh.id
+      LEFT JOIN email_history eh ON ehc.history_id = eh.batch_id
       ORDER BY ehc.sent_at DESC
     `);
 
@@ -871,9 +963,176 @@ app.get('/api/tracking/all', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+app.get('/track-response', async (req, res) => {
+  const { batchId, email, response } = req.query;
+
+  // ✅ Step 1: Log exactly what came in
+  console.log('📩 /track-response hit:', { batchId, email, response });
+
+  // ✅ Step 2: Validation check
+  if (!batchId || !email || !['interested', 'not_interested'].includes(response)) {
+    console.log('❌ Validation failed:', { batchId, email, response });
+    return res.status(400).send(`
+      <html><body style="font-family:Arial;text-align:center;padding:60px;">
+        <h2>❌ Invalid Request</h2>
+        <p>batchId: ${batchId}</p>
+        <p>email: ${email}</p>
+        <p>response: ${response}</p>
+      </body></html>
+    `);
+  }
+
+  try {
+    // ✅ Step 3: Check if record exists at all
+    const [existing] = await pool.query(
+      `SELECT id, email, response FROM email_history_companies 
+       WHERE batch_id = ? AND email = ?`,
+      [batchId, email]
+    );
+
+    console.log('🔍 DB lookup result:', existing);
+
+    // ✅ Step 4: Record not found at all
+    if (existing.length === 0) {
+      console.log('❌ No record found for:', { batchId, email });
+      return res.status(404).send(`
+        <html><body style="font-family:Arial;text-align:center;padding:60px;">
+          <h2>❌ Record Not Found</h2>
+          <p>No record found for batchId: <strong>${batchId}</strong></p>
+          <p>email: <strong>${email}</strong></p>
+          <p>Check if the email was inserted into email_history_companies table.</p>
+        </body></html>
+      `);
+    }
+
+    // ✅ Step 5: Already responded
+    if (existing[0].response !== null) {
+      return res.send(`
+        <html><body style="font-family:Arial;text-align:center;padding:60px;">
+          <h2>⚠️ Already Responded</h2>
+          <p>Your answer: <strong>${existing[0].response.replace('_', ' ')}</strong></p>
+        </body></html>
+      `);
+    }
+
+    // ✅ Step 6: Do the update
+    // ✅ Fixed — use batch_id consistently
+const [updateResult] = await pool.query(
+  `UPDATE email_history_companies
+   SET response = ?, responded_at = NOW()
+   WHERE batch_id = ? AND email = ?`,
+  [response, batchId, email]
+);
+
+    console.log('✅ Update result:', updateResult);
+
+    // ✅ Step 7: Check if update actually affected a row
+    if (updateResult.affectedRows === 0) {
+      console.log('❌ Update ran but affected 0 rows');
+      return res.status(500).send(`
+        <html><body style="font-family:Arial;text-align:center;padding:60px;">
+          <h2>❌ Update Failed</h2>
+          <p>Query ran but no rows were updated.</p>
+          <p>batchId: ${batchId} | email: ${email}</p>
+        </body></html>
+      `);
+    }
+
+    const label = response === 'interested' ? '✅ Interested' : '❌ Not Interested';
+    const color = response === 'interested' ? '#22c55e' : '#ef4444';
+
+    return res.send(`
+      <html><body style="font-family:Arial;text-align:center;padding:60px;">
+        <h2 style="color:${color};">${label}</h2>
+        <p>Thank you! Your response has been recorded.</p>
+      </body></html>
+    `);
+
+  } catch (err) {
+    // ✅ Step 8: Show exact DB error on screen
+    console.error('💥 track-response error:', err);
+    return res.status(500).send(`
+      <html><body style="font-family:Arial;text-align:center;padding:60px;">
+        <h2>💥 Server Error</h2>
+        <p><strong>${err.message}</strong></p>
+        <pre style="text-align:left;background:#f3f4f6;padding:16px;">${err.stack}</pre>
+      </body></html>
+    `);
+  }
+});
+
+// app.get('/track-response', async (req, res) => {
+//   const { batchId, email, response } = req.query;
+
+//   if (!batchId || !email || !['interested', 'not_interested'].includes(response)) {
+//     return res.status(400).send('Invalid request.');
+//   }
+
+//   try {
+//     const [existing] = await pool.query(
+//       `SELECT id, response FROM email_history_companies 
+//        WHERE batch_id = ? AND email = ?`,
+//       [batchId, email]
+//     );
+
+//     if (existing.length === 0) {
+//       return res.status(404).send(`
+//         <html><body style="font-family:Arial;text-align:center;padding:60px;">
+//           <h2>❌ Record Not Found</h2>
+//           <p>No record found for this email.</p>
+//         </body></html>
+//       `);
+//     }
+
+//     if (existing[0].response !== null) {
+//       return res.send(`
+//         <html><body style="font-family:Arial;text-align:center;padding:60px;">
+//           <h2>⚠️ Already Responded</h2>
+//           <p>Your answer: <strong>${existing[0].response.replace('_', ' ')}</strong></p>
+//         </body></html>
+//       `);
+//     }
+
+//     await pool.query(
+//       `UPDATE email_history_companies
+//        SET response = ?, responded_at = NOW()
+//        WHERE batch_id = ? AND email = ?`,
+//       [response, batchId, email]
+//     );
+
+//     const label = response === 'interested' ? '✅ Interested' : '❌ Not Interested';
+//     const color = response === 'interested' ? '#22c55e' : '#ef4444';
+
+//     return res.send(`
+//       <html><body style="font-family:Arial;text-align:center;padding:60px;">
+//         <h2 style="color:${color};">${label}</h2>
+//         <p>Thank you! Your response has been recorded.</p>
+//       </body></html>
+//     `);
+
+//   } catch (err) {
+//     console.error('Track response error:', err);
+//     res.status(500).send(`
+//       <html><body style="font-family:Arial;text-align:center;padding:60px;">
+//         <h2>💥 Server Error</h2>
+//         <p>${err.message}</p>
+//       </body></html>
+//     `);
+//   }
+// });
 /* ─────────────────────────────────────────────
    START SERVER
 ───────────────────────────────────────────── */
+console.log('📧 Starting email reply monitor...');
+
+checkForReplies();
+
+setInterval(() => {
+  checkForReplies();
+}, 2 * 60 * 1000);
+
+
 
 app.listen(5000, () => {
   console.log(`Server running on port 5000`);

@@ -3,10 +3,6 @@ const { simpleParser } = require('mailparser');
 const mysql = require('mysql2/promise');
 require('dotenv').config();
 
-/* ─────────────────────────────────────────────
-   MYSQL
-───────────────────────────────────────────── */
-
 const pool = mysql.createPool({
   host: 'localhost',
   user: 'root',
@@ -14,28 +10,7 @@ const pool = mysql.createPool({
   database: 'seller_buyer_dummy',
 });
 
-/* ─────────────────────────────────────────────
-   DB HELPERS
-───────────────────────────────────────────── */
 
-async function ensureTable() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS email_replies (
-      id          INT AUTO_INCREMENT PRIMARY KEY,
-      batch_id    VARCHAR(255) NOT NULL,
-      history_id  INT,
-      from_email  VARCHAR(255),
-      to_email    VARCHAR(255),
-      subject     TEXT,
-      message     LONGTEXT,
-      product_name VARCHAR(255),
-      reply_date  DATETIME,
-      
-      INDEX idx_batch (batch_id),
-      INDEX idx_history (history_id)
-    )
-  `);
-}
 
 async function saveReply({ batchId, historyId, productName, fromEmail, toEmail, subject, message }) {
   const [existing] = await pool.query(
@@ -60,66 +35,48 @@ async function saveReply({ batchId, historyId, productName, fromEmail, toEmail, 
   return true;
 }
 
-/* ─────────────────────────────────────────────
-   BATCH ID EXTRACTION
-───────────────────────────────────────────── */
 function extractBatchId(parsed) {
   const subject = parsed.subject || '';
   let batchId = null;
   let productName = null;
 
-  // Strategy 1: [BATCH:xxx] in subject
-  const subjectBatchMatch = subject.match(/\[BATCH:([^\]]+)\]/);
+  const subjectBatchMatch   = subject.match(/\[BATCH:([^\]]+)\]/);
   const subjectProductMatch = subject.match(/\[PRODUCT:([^\]]+)\]/);
-  
-  if (subjectBatchMatch) {
-    console.log(`✅ Found batch in subject: ${subjectBatchMatch[1]}`);
-    batchId = subjectBatchMatch[1];
-  }
-  if (subjectProductMatch) {
-    productName = subjectProductMatch[1];
-  }
 
-  // Strategy 2: References header
+  if (subjectBatchMatch)   batchId     = subjectBatchMatch[1];
+  if (subjectProductMatch) productName = subjectProductMatch[1];
+
   if (!batchId && parsed.references) {
     const refsStr = Array.isArray(parsed.references)
       ? parsed.references.join(' ')
       : String(parsed.references);
-    const refBatchMatch = refsStr.match(/\[BATCH:([^\]]+)\]/);
-    const refProductMatch = refsStr.match(/\[PRODUCT:([^\]]+)\]/);
-    
-    if (refBatchMatch) batchId = refBatchMatch[1];
-    if (refProductMatch) productName = refProductMatch[1];
+    const m = refsStr.match(/\[BATCH:([^\]]+)\]/);
+    const p = refsStr.match(/\[PRODUCT:([^\]]+)\]/);
+    if (m) batchId     = m[1];
+    if (p) productName = p[1];
   }
 
-  // Strategy 3: In-Reply-To header
   if (!batchId && parsed.inReplyTo) {
-    const replyToStr = String(parsed.inReplyTo);
-    const replyBatchMatch = replyToStr.match(/\[BATCH:([^\]]+)\]/);
-    const replyProductMatch = replyToStr.match(/\[PRODUCT:([^\]]+)\]/);
-    
-    if (replyBatchMatch) batchId = replyBatchMatch[1];
-    if (replyProductMatch) productName = replyProductMatch[1];
+    const s = String(parsed.inReplyTo);
+    const m = s.match(/\[BATCH:([^\]]+)\]/);
+    const p = s.match(/\[PRODUCT:([^\]]+)\]/);
+    if (m) batchId     = m[1];
+    if (p) productName = p[1];
   }
 
-  // Strategy 4: Plain-text body
   if ((!batchId || !productName) && parsed.text) {
     if (!batchId) {
-      const bodyBatchMatch = parsed.text.match(/\[BATCH:([^\]]+)\]/);
-      if (bodyBatchMatch) batchId = bodyBatchMatch[1];
+      const m = parsed.text.match(/\[BATCH:([^\]]+)\]/);
+      if (m) batchId = m[1];
     }
     if (!productName) {
-      const bodyProductMatch = parsed.text.match(/\[PRODUCT:([^\]]+)\]/);
-      if (bodyProductMatch) productName = bodyProductMatch[1];
+      const p = parsed.text.match(/\[PRODUCT:([^\]]+)\]/);
+      if (p) productName = p[1];
     }
   }
 
   return { batchId, productName };
 }
-
-/* ─────────────────────────────────────────────
-   IMAP — CHECK FOR REPLIES
-───────────────────────────────────────────── */
 
 function checkForReplies() {
   const imap = new Imap({
@@ -138,7 +95,7 @@ function checkForReplies() {
 
   imap.on('error', (err) => {
     if (err.code === 'ECONNRESET') {
-      console.warn('⚠️  Gmail closed the connection (ECONNRESET) — will retry on next poll');
+      console.warn('⚠️  ECONNRESET — will retry on next poll');
     } else {
       console.error('IMAP error:', err.message);
     }
@@ -146,8 +103,26 @@ function checkForReplies() {
 
   imap.on('end', () => console.log('🔌 IMAP disconnected\n'));
 
-  imap.once('ready', () => {
+  imap.once('ready', async () => {
     console.log('\n📬 Checking for email replies...');
+
+    // ✅ Step 1: Fetch all known batch_ids from email_history
+    let knownBatchIds = [];
+    try {
+      const [rows] = await pool.query(
+        'SELECT batch_id FROM email_history WHERE batch_id IS NOT NULL'
+      );
+      knownBatchIds = rows.map(r => r.batch_id);
+      console.log(`📋 Found ${knownBatchIds.length} known batch(es) in DB`);
+    } catch (err) {
+      console.error('Failed to fetch batch ids:', err.message);
+      return imap.end();
+    }
+
+    if (knownBatchIds.length === 0) {
+      console.log('📭 No batches in DB — nothing to match against');
+      return imap.end();
+    }
 
     imap.openBox('INBOX', false, (err) => {
       if (err) {
@@ -155,10 +130,11 @@ function checkForReplies() {
         return imap.end();
       }
 
+      // ✅ Step 2: Only fetch emails since earliest batch was sent
       const date = new Date();
-      date.setDate(date.getDate() - 7); // Last 7 days
+      date.setDate(date.getDate() - 7);
       const sinceDate = date.toISOString().split('T')[0];
-      
+
       imap.search([['SINCE', sinceDate]], (err, results) => {
         if (err) {
           console.error('Search error:', err.message);
@@ -170,9 +146,8 @@ function checkForReplies() {
           return imap.end();
         }
 
-        console.log(`📩 Found ${results.length} email(s) from last 7 days`);
+        console.log(`📩 Found ${results.length} email(s) — filtering by known batches...`);
 
-        // 👉 Don't mark as seen - leave emails unchanged
         const fetch = imap.fetch(results, { bodies: '', markSeen: false });
         let processed = 0;
         let saved = 0;
@@ -186,28 +161,28 @@ function checkForReplies() {
               }
 
               processed++;
-              const fromEmail = parsed.from?.text || '';
-              const toEmail   = parsed.to?.text   || '';
-              const subject   = parsed.subject    || '';
+              const fromEmail = parsed.from?.value?.[0]?.address || parsed.from?.text || '';
+              const toEmail   = parsed.to?.value?.[0]?.address   || parsed.to?.text   || '';
+              const subject   = parsed.subject || '';
               const yourEmail = (process.env.EMAIL_USER || '').toLowerCase();
 
               console.log(`\n=== EMAIL #${processed} ===`);
               console.log('From:   ', fromEmail);
               console.log('Subject:', subject);
 
+              // ✅ Skip own emails
               const fromAddress = (parsed.from?.value?.[0]?.address || '').toLowerCase();
-              
               if (fromAddress === yourEmail) {
-                console.log(`⏭️  Skipped — this is YOUR email (not a customer reply)`);
+                console.log(`⏭️  Skipped — your own email`);
                 return;
               }
 
-              const isReply = subject.toLowerCase().startsWith('re:');
-              if (!isReply) {
-                console.log(`⏭️  Skipped — not a reply email (missing "Re:" in subject)`);
+              // ✅ Skip non-replies
+              if (!subject.toLowerCase().startsWith('re:')) {
+                console.log(`⏭️  Skipped — not a reply`);
                 return;
               }
-              
+
               const { batchId } = extractBatchId(parsed);
 
               if (!batchId) {
@@ -215,21 +190,28 @@ function checkForReplies() {
                 return;
               }
 
-              // Fetch history_id and product from email_history table
+              // ✅ Step 3: Only process if batchId exists in our DB
+              if (!knownBatchIds.includes(batchId)) {
+                console.log(`⏭️  Skipped — batchId ${batchId} not in our DB`);
+                return;
+              }
+
+              // ✅ Step 4: Fetch id + product using batch_id (fixed column name)
               const [historyRows] = await pool.query(
-                'SELECT id, product FROM email_history WHERE id = ?', 
+                'SELECT id, product FROM email_history WHERE batch_id = ?',
                 [batchId]
               );
 
-              let historyId = null;
+              let historyId   = null;
               let productName = null;
 
               if (historyRows.length > 0) {
-                historyId = historyRows[0].id;
+                historyId   = historyRows[0].id;       // ✅ correct — auto increment id
                 productName = historyRows[0].product;
-                console.log(`📋 Found history record - ID: ${historyId}, Product: ${productName}`);
+                console.log(`📋 Matched history — id: ${historyId}, product: ${productName}`);
               } else {
                 console.log(`⚠️ No history record found for batch_id: ${batchId}`);
+                return; // ✅ skip if no parent record
               }
 
               const messageText = parsed.text || parsed.html || '';
@@ -237,8 +219,8 @@ function checkForReplies() {
               try {
                 const wasSaved = await saveReply({
                   batchId,
-                  historyId: historyId,
-                  productName: productName || null,
+                  historyId,
+                  productName,
                   fromEmail,
                   toEmail,
                   subject,
@@ -246,7 +228,7 @@ function checkForReplies() {
                 });
 
                 if (wasSaved) {
-                  console.log(`✅✅✅ SAVED customer reply from ${fromEmail} → batch ${batchId} (history_id: ${historyId})`);
+                  console.log(`✅ SAVED reply from ${fromEmail} → batch ${batchId} (history_id: ${historyId})`);
                   saved++;
                 }
               } catch (dbErr) {
@@ -257,7 +239,7 @@ function checkForReplies() {
         });
 
         fetch.on('end', () => {
-          console.log(`\n✅ Done — processed ${processed}, saved ${saved} customer replies`);
+          console.log(`\n✅ Done — processed ${processed}, saved ${saved} replies`);
           imap.end();
         });
 
@@ -272,14 +254,4 @@ function checkForReplies() {
   imap.connect();
 }
 
-/* ─────────────────────────────────────────────
-   BOOT
-───────────────────────────────────────────── */
-
-(async () => {
-  await ensureTable();
-  console.log('✅ email_replies table ready');
-
-  checkForReplies();
-  setInterval(checkForReplies, 2 * 60 * 1000);
-})();
+module.exports = { checkForReplies };
