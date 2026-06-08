@@ -112,7 +112,7 @@ function buildHtml(message, product, interestedUrl, notInterestedUrl) {
 async function dbInsertCompanyRow(batchId, company, status) {
   await pool.query(
     `INSERT INTO email_history_companies
-      (history_id, company_name, country, contact_name, email, sent_at, status, template_used)
+      (batch_id, company_name, country, contact_name, email, sent_at, status, template_used)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       batchId,
@@ -139,24 +139,7 @@ emailQueue.process(async (job) => {
   console.log(`Processing job for ${recipientEmail} in batch ${batchId}`);
   await job.progress(20);
 
-  const trackedSubject = `${subject || `Business Opportunity - ${product}`} [BATCH:${batchId}]`;
-
-  // ✅ Lookup parent by batch_id
-  let historyRowId = null;
-  try {
-    const [parentRows] = await pool.query(
-      'SELECT id FROM email_history WHERE batch_id = ?',
-      [batchId]
-    );
-    if (parentRows.length > 0) {
-      historyRowId = parentRows[0].id;
-      console.log(`✅ Found parent record id: ${historyRowId} for batchId: ${batchId}`);
-    } else {
-      console.warn(`⚠️ No parent record found for batchId: ${batchId}`);
-    }
-  } catch (err) {
-    console.error(`Error looking up parent record: ${err.message}`);
-  }
+const trackedSubject = `${subject || `Business Opportunity - ${product}`} [BATCH:${batchId}]`;
 
   let sendStatus = 'Sent';
   let sendError = null;
@@ -192,37 +175,27 @@ emailQueue.process(async (job) => {
 
   // ✅ Insert/Update company record using historyRowId
   try {
-    const [existing] = await pool.query(
-      `SELECT id FROM email_history_companies 
-       WHERE history_id = ? AND email = ?`,
-      [historyRowId, recipientEmail]
-    );
+const [existing] = await pool.query(
+  `SELECT id FROM email_history_companies 
+   WHERE batch_id = ? AND email = ?`,
+  [batchId, recipientEmail]
+);
 
     if (existing.length > 0) {
-      await pool.query(
-        `UPDATE email_history_companies 
-         SET sent_at = ?, status = ?, template_used = ?
-         WHERE history_id = ? AND email = ?`,
-        [new Date(), sendStatus, company.templateUsed || 'Welcome Template', historyRowId, recipientEmail]
-      );
+await pool.query(
+  `UPDATE email_history_companies 
+   SET sent_at = ?, status = ?, template_used = ?, product_name = ?
+   WHERE batch_id = ? AND email = ?`,
+  [new Date(), sendStatus, company.templateUsed || 'Welcome Template', product, batchId, recipientEmail]
+);
       console.log(`📝 Updated record for ${recipientEmail}`);
     } else {
-      await pool.query(
-        `INSERT INTO email_history_companies
-          (history_id, batch_id, company_name, country, contact_name, email, sent_at, status, template_used, response, responded_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)`,
-        [
-          historyRowId,
-          batchId,                                        // ✅ store batch_id too
-          company.companyName || 'Unknown',
-          company.country || null,
-          company.contactName || company.companyName || 'Unknown',
-          recipientEmail,
-          new Date(),
-          sendStatus,
-          company.templateUsed || 'Welcome Template',
-        ]
-      );
+await pool.query(
+  `INSERT INTO email_history_companies
+    (batch_id, company_name, country, contact_name, email, sent_at, status, template_used, product_name)
+   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  [batchId, company.companyName || 'Unknown', company.country || null, company.contactName || company.companyName || 'Unknown', recipientEmail, new Date(), sendStatus, company.templateUsed || 'Welcome Template', product]
+);
       console.log(`📝 Inserted record for ${recipientEmail}`);
     }
 
@@ -260,11 +233,7 @@ app.post('/send-email', async (req, res) => {
   }
 
   try {
-    // ✅ Insert with batch_id column (no duplicate due to UNIQUE)
-    await pool.query(
-      'INSERT IGNORE INTO email_history (batch_id, product, date) VALUES (?, ?, ?)',
-      [batchId, product, batchDate]
-    );
+  
 
     console.log(`✅ Parent record created for batchId: ${batchId}`);
 
@@ -460,14 +429,26 @@ app.get("/filters/products", async (req, res) => {
 
 app.get('/history', async (req, res) => {
   try {
+    // Change this query - remove email_history table
     const [results] = await pool.query(`
-      SELECT h.id, h.product, h.date,
-             c.company_name,c.country, c.contact_name, c.email, c.sent_at, c.status,c.response,c.responded_at, c.template_used
-      FROM email_history h
-      LEFT JOIN email_history_companies c ON h.id = c.history_id
-      ORDER BY h.date DESC
+      SELECT 
+        batch_id as id,
+        product_name as product,
+        sent_at as date,
+        company_name,
+        country,
+        contact_name,
+        email,
+        sent_at,
+        status,
+        response,
+        responded_at,
+        template_used
+      FROM email_history_companies
+      ORDER BY sent_at DESC
     `);
-
+    
+    // Group by batch_id
     const historyMap = {};
     results.forEach((row) => {
       if (!historyMap[row.id]) {
@@ -477,7 +458,7 @@ app.get('/history', async (req, res) => {
         historyMap[row.id].companies.push({
           companyName: row.company_name,
           contactName: row.contact_name,
-           country: row.country, 
+          country: row.country,
           email: row.email,
           sentAt: row.sent_at,
           response: row.response,
@@ -551,75 +532,99 @@ app.get('/history/:id', async (req, res) => {
     const [results] = await pool.query(
       `
       SELECT
-        h.id,
-        h.product,
-        h.date,
-
-        c.company_name,
-        c.contact_name,
-        c.email,
-        c.sent_at,
-        c.status AS email_status,
-        c.response AS company_response,
-        c.responded_at AS company_responded_at,
-        c.template_used,
-
-        er.message AS reply_message,
-        er.interest,
-        er.replied_at
-
-      FROM email_history h
-
-      LEFT JOIN email_history_companies c
-        ON h.id = c.history_id
-
-      LEFT JOIN email_replies er
-        ON er.history_id = h.id
-        AND LOWER(er.from_email) = LOWER(c.email)
-
-      WHERE h.id = ?
+        batch_id AS id,
+        product_name AS product,
+        company_name,
+        contact_name,
+        email,
+        sent_at,
+        status,
+        response,
+        responded_at,
+        template_used,
+        message,
+        reply_date,
+        subject
+      FROM email_history_companies
+      WHERE batch_id = ?
+      ORDER BY sent_at DESC
       `,
       [id]
     );
 
-    if (results.length === 0) {
-      return res.status(404).json({ error: 'Entry not found' });
+    if (!results.length) {
+      return res.status(404).json({
+        success: false,
+        message: 'History not found'
+      });
     }
 
-    const historyEntry = {
-      id: results[0].id,
-      product: results[0].product,
-      date: results[0].date,
-      companies: [],
+    const counts = {
+      total: results.length,
+      replied: 0,
+      interested: 0,
+      notInterested: 0,
+      emailSent: 0
     };
 
-    results.forEach((row) => {
-      let status = row.email_status || 'Sent';
+    // If any row in the batch contains a message
+    counts.replied = results.some(
+      row => row.message && row.message.trim() !== ''
+    ) ? 1 : 0;
 
-      if (row.interest === 'interested') {
-        status = 'Interested';
-      } else if (row.interest === 'not_interested') {
-        status = 'Not Interested';
-      } else if (row.reply_message || row.replied_at) {
-        status = 'Replied';
+    results.forEach((row) => {
+      if (row.response === 'interested') {
+        counts.interested++;
       }
 
-      historyEntry.companies.push({
+      if (row.response === 'not_interested') {
+        counts.notInterested++;
+      }
+
+      if (row.status === 'sent') {
+        counts.emailSent++;
+      }
+    });
+
+    const companies = results.map((row) => {
+      let displayStatus = 'Email Sent';
+
+      if (row.message && row.message.trim() !== '') {
+        displayStatus = 'Replied';
+      } else if (row.response === 'interested') {
+        displayStatus = 'Interested';
+      } else if (row.response === 'not_interested') {
+        displayStatus = 'Not Interested';
+      }
+
+      return {
         companyName: row.company_name,
         contactName: row.contact_name,
         email: row.email,
         sentAt: row.sent_at,
-        response: row.reply_message || row.company_response,
-        respondedAt: row.replied_at || row.company_responded_at,
-        status,
+        response: row.response,
+        respondedAt: row.reply_date || row.responded_at,
+        status: displayStatus,
         templateUsed: row.template_used,
-      });
+        subject: row.subject,
+        message: row.message
+      };
     });
 
-    res.json(historyEntry);
+    res.json({
+      id: results[0].id,
+      product: results[0].product,
+      date: results[0].sent_at,
+      companies,
+      counts
+    });
+
   } catch (err) {
     console.error('GET /history/:id error:', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({
+      success: false,
+      message: err.message
+    });
   }
 });
 app.get('/history/:id/replies', async (req, res) => {
@@ -697,27 +702,28 @@ app.delete("/email-templates/:id", async (req, res) => {
 app.get('/api/replyhistory', async (req, res) => {
   try {
     const query = `
-      SELECT DISTINCT
-        er.id,
-        er.batch_id,
-        er.history_id,
-        er.from_email,
-        er.to_email,
-        er.subject,
-        er.message,
-        er.product_name,
-        er.reply_date,
-        ehc.company_name,
-        ehc.contact_name,
-        ehc.status,
-        ehc.template_used,
-        be.buyer_id,
-        bc.contact_number
-      FROM email_replies er
-      LEFT JOIN email_history_companies ehc ON ehc.history_id = er.history_id
-      LEFT JOIN buyer_emails be ON be.email = er.to_email
-      LEFT JOIN buyer_contacts bc ON bc.buyer_id = be.buyer_id
-      ORDER BY er.reply_date DESC
+      SELECT 
+        id,
+        batch_id,
+        from_email,
+        to_email,
+        subject,
+        message,
+        product_name,
+        reply_date,
+        company_name,
+        contact_name,
+        country,
+        status,
+        template_used,
+        response,
+        responded_at,
+        sent_at
+      FROM email_history_companies
+      WHERE from_email IS NOT NULL 
+        AND message IS NOT NULL
+        AND reply_date IS NOT NULL
+      ORDER BY reply_date DESC
     `;
 
     const [results] = await pool.query(query);
@@ -726,16 +732,7 @@ app.get('/api/replyhistory', async (req, res) => {
       return res.status(404).json({ success: false, message: "No email replies found" });
     }
 
-    const uniqueResults = [];
-    const seenIds = new Set();
-    for (const reply of results) {
-      if (!seenIds.has(reply.id)) {
-        seenIds.add(reply.id);
-        uniqueResults.push(reply);
-      }
-    }
-
-    const cleanedResults = uniqueResults.map(reply => {
+    const cleanedResults = results.map(reply => {
       let cleanedSubject = reply.subject || '';
       cleanedSubject = cleanedSubject.replace(/\s*\[BATCH:[^\]]+\]/g, '');
       cleanedSubject = cleanedSubject.replace(/^Re:\s*/, '');
@@ -776,7 +773,6 @@ app.get('/api/replyhistory', async (req, res) => {
       return {
         id: reply.id,
         batch_id: reply.batch_id,
-        history_id: reply.history_id,
         from_email: reply.from_email,
         to_email: reply.to_email,
         subject: cleanedSubject,
@@ -785,10 +781,11 @@ app.get('/api/replyhistory', async (req, res) => {
         reply_date: reply.reply_date,
         company_name: reply.company_name,
         contact_name: reply.contact_name,
+        country: reply.country,
         status: reply.status,
         template_used: reply.template_used,
-        buyer_id: reply.buyer_id,
-        contact_number: reply.contact_number
+        response: reply.response,
+        responded_at: reply.responded_at
       };
     });
 
@@ -800,32 +797,32 @@ app.get('/api/replyhistory', async (req, res) => {
   }
 });
 
+
+
 app.get('/api/replyhistory/:id', async (req, res) => {
   try {
     const { id } = req.params;
 
     const query = `
       SELECT 
-        er.id,
-        er.batch_id,
-        er.history_id,
-        er.from_email,
-        er.to_email,
-        er.subject,
-        er.message,
-        er.product_name,
-        er.reply_date,
-        ehc.company_name,
-        ehc.contact_name,
-        ehc.status,
-        ehc.template_used,
-        be.buyer_id,
-        bc.contact_number
-      FROM email_replies er
-      LEFT JOIN email_history_companies ehc ON ehc.history_id = er.history_id
-      LEFT JOIN buyer_emails be ON be.email = er.to_email
-      LEFT JOIN buyer_contacts bc ON bc.buyer_id = be.buyer_id
-      WHERE er.id = ?
+        id,
+        batch_id,
+        from_email,
+        to_email,
+        subject,
+        message,
+        product_name,
+        reply_date,
+        company_name,
+        contact_name,
+        country,
+        status,
+        template_used,
+        response,
+        responded_at,
+        sent_at
+      FROM email_history_companies
+      WHERE id = ?
       LIMIT 1
     `;
 
@@ -835,11 +832,13 @@ app.get('/api/replyhistory/:id', async (req, res) => {
       return res.status(404).json({ success: false, message: "Email reply not found" });
     }
 
-    let cleanedSubject = results[0].subject;
+    const reply = results[0];
+
+    let cleanedSubject = reply.subject || '';
     cleanedSubject = cleanedSubject.replace(/\s*\[BATCH:[^\]]+\]/g, '');
     cleanedSubject = cleanedSubject.replace(/^Re:\s*/, '');
 
-    let cleanedMessage = results[0].message;
+    let cleanedMessage = reply.message;
     const onIndex = cleanedMessage.indexOf('\nOn');
     if (onIndex !== -1) {
       cleanedMessage = cleanedMessage.substring(0, onIndex).trim();
@@ -853,21 +852,21 @@ app.get('/api/replyhistory/:id', async (req, res) => {
     res.json({
       success: true,
       data: {
-        id: results[0].id,
-        batch_id: results[0].batch_id,
-        history_id: results[0].history_id,
-        from_email: results[0].from_email,
-        to_email: results[0].to_email,
+        id: reply.id,
+        batch_id: reply.batch_id,
+        from_email: reply.from_email,
+        to_email: reply.to_email,
         subject: cleanedSubject,
         message: cleanedMessage,
-        product_name: results[0].product_name,
-        reply_date: results[0].reply_date,
-        company_name: results[0].company_name,
-        contact_name: results[0].contact_name,
-        status: results[0].status,
-        template_used: results[0].template_used,
-        buyer_id: results[0].buyer_id,
-        contact_number: results[0].contact_number
+        product_name: reply.product_name,
+        reply_date: reply.reply_date,
+        company_name: reply.company_name,
+        contact_name: reply.contact_name,
+        country: reply.country,
+        status: reply.status,
+        template_used: reply.template_used,
+        response: reply.response,
+        responded_at: reply.responded_at
       }
     });
 
@@ -877,51 +876,96 @@ app.get('/api/replyhistory/:id', async (req, res) => {
   }
 });
 
+
+
+
+
 app.get('/api/tracking/all', async (req, res) => {
   try {
     // 1. GET ALL SENT EMAILS
     const [sentEmails] = await pool.query(`
       SELECT 
-        ehc.id,
-        ehc.history_id,
-        ehc.company_name,
-        ehc.country,
-        ehc.contact_name,
-        ehc.email,
-        ehc.sent_at,
-        ehc.status,
-        ehc.response,
-        ehc.responded_at,
-        ehc.template_used,
-        eh.product as product_name,
+        id,
+        batch_id,
+        company_name,
+        country,
+        contact_name,
+        email,
+        sent_at,
+        status,
+        response,
+        responded_at,
+        template_used,
+        product_name,
         'sent' as type
-      FROM email_history_companies ehc
-      LEFT JOIN email_history eh ON ehc.history_id = eh.batch_id
-      ORDER BY ehc.sent_at DESC
+      FROM email_history_companies
+      WHERE from_email IS NULL OR from_email = ''
+      ORDER BY sent_at DESC
     `);
 
-    // 2. GET ALL REPLIED EMAILS
+    // 2. GET ALL REPLIED EMAILS (from email_history_companies)
     const [repliedEmails] = await pool.query(`
       SELECT 
-        er.id,
-        er.batch_id,
-        er.history_id,
-        er.from_email as email,
-        er.to_email,
-        er.subject,
-        er.message as reply_message,
-        er.product_name,
-        er.reply_date as replied_at,
-        ehc.company_name,
-        ehc.country,
-        ehc.contact_name,
+        id,
+        batch_id,
+        company_name,
+        country,
+        contact_name,
+        email,
+        from_email,
+        to_email,
+        subject,
+        message,
+        product_name,
+        reply_date,
+        response,
+        responded_at,
         'replied' as type
-      FROM email_replies er
-      LEFT JOIN email_history_companies ehc ON ehc.history_id = er.history_id AND ehc.email = er.from_email
-      ORDER BY er.reply_date DESC
+      FROM email_history_companies
+      WHERE from_email IS NOT NULL 
+        AND from_email != ''
+        AND message IS NOT NULL
+        AND reply_date IS NOT NULL
+      ORDER BY reply_date DESC
     `);
 
-    // 3. GET NOT CONTACTED COMPANIES
+    // 3. GET INTERESTED RESPONSES
+    const [interestedEmails] = await pool.query(`
+      SELECT 
+        id,
+        batch_id,
+        company_name,
+        country,
+        contact_name,
+        email,
+        response,
+        responded_at,
+        product_name,
+        'interested' as type
+      FROM email_history_companies
+      WHERE response = 'interested'
+      ORDER BY responded_at DESC
+    `);
+
+    // 4. GET NOT INTERESTED RESPONSES
+    const [notInterestedEmails] = await pool.query(`
+      SELECT 
+        id,
+        batch_id,
+        company_name,
+        country,
+        contact_name,
+        email,
+        response,
+        responded_at,
+        product_name,
+        'not_interested' as type
+      FROM email_history_companies
+      WHERE response = 'not_interested'
+      ORDER BY responded_at DESC
+    `);
+
+    // 5. GET NOT CONTACTED COMPANIES
     const [notContacted] = await pool.query(`
       SELECT DISTINCT
         b.id,
@@ -943,17 +987,68 @@ app.get('/api/tracking/all', async (req, res) => {
       ORDER BY b.company_name
     `);
 
-    // 4. RETURN ALL DATA IN ONE RESPONSE
+    // Clean the messages for replied emails
+    const cleanedRepliedEmails = repliedEmails.map(reply => {
+      let cleanedSubject = reply.subject || '';
+      cleanedSubject = cleanedSubject.replace(/\s*\[BATCH:[^\]]+\]/g, '');
+      cleanedSubject = cleanedSubject.replace(/^Re:\s*/, '');
+
+      let cleanedMessage = reply.message || '';
+      
+      // Remove everything after "On [date] wrote:" pattern
+      const onIndex = cleanedMessage.indexOf('\nOn ');
+      if (onIndex !== -1) {
+        cleanedMessage = cleanedMessage.substring(0, onIndex).trim();
+      }
+      
+      // Remove "wrote:" and everything after
+      const wroteIndex = cleanedMessage.indexOf('wrote:');
+      if (wroteIndex !== -1) {
+        cleanedMessage = cleanedMessage.substring(0, wroteIndex).trim();
+      }
+      
+      // Remove email headers and quotes
+      cleanedMessage = cleanedMessage
+        .replace(/\\u003C/g, '<')
+        .replace(/\\u003E/g, '>')
+        .replace(/\[[^\]]*\]/g, '')
+        .replace(/https?:\/\/[^\s]+/g, '')
+        .replace(/\n\s*\n\s*\n/g, '\n\n')
+        .trim();
+
+      return {
+        id: reply.id,
+        batch_id: reply.batch_id,
+        company_name: reply.company_name,
+        country: reply.country,
+        contact_name: reply.contact_name,
+        email: reply.email,
+        from_email: reply.from_email,
+        to_email: reply.to_email,
+        subject: cleanedSubject,
+        message: cleanedMessage,
+        product_name: reply.product_name,
+        reply_date: reply.reply_date,
+        response: reply.response,
+        responded_at: reply.responded_at,
+        type: reply.type
+      };
+    });
+
     res.json({
       success: true,
       data: {
         sent: sentEmails,
-        replied: repliedEmails,
+        replied: cleanedRepliedEmails,
+        interested: interestedEmails,
+        not_interested: notInterestedEmails,
         notContacted: notContacted
       },
       counts: {
         totalSent: sentEmails.length,
-        totalReplied: repliedEmails.length,
+        totalReplied: cleanedRepliedEmails.length,
+        totalInterested: interestedEmails.length,
+        totalNotInterested: notInterestedEmails.length,
         totalNotContacted: notContacted.length
       }
     });
@@ -963,7 +1058,6 @@ app.get('/api/tracking/all', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
 app.get('/track-response', async (req, res) => {
   const { batchId, email, response } = req.query;
 
@@ -1062,65 +1156,6 @@ const [updateResult] = await pool.query(
   }
 });
 
-// app.get('/track-response', async (req, res) => {
-//   const { batchId, email, response } = req.query;
-
-//   if (!batchId || !email || !['interested', 'not_interested'].includes(response)) {
-//     return res.status(400).send('Invalid request.');
-//   }
-
-//   try {
-//     const [existing] = await pool.query(
-//       `SELECT id, response FROM email_history_companies 
-//        WHERE batch_id = ? AND email = ?`,
-//       [batchId, email]
-//     );
-
-//     if (existing.length === 0) {
-//       return res.status(404).send(`
-//         <html><body style="font-family:Arial;text-align:center;padding:60px;">
-//           <h2>❌ Record Not Found</h2>
-//           <p>No record found for this email.</p>
-//         </body></html>
-//       `);
-//     }
-
-//     if (existing[0].response !== null) {
-//       return res.send(`
-//         <html><body style="font-family:Arial;text-align:center;padding:60px;">
-//           <h2>⚠️ Already Responded</h2>
-//           <p>Your answer: <strong>${existing[0].response.replace('_', ' ')}</strong></p>
-//         </body></html>
-//       `);
-//     }
-
-//     await pool.query(
-//       `UPDATE email_history_companies
-//        SET response = ?, responded_at = NOW()
-//        WHERE batch_id = ? AND email = ?`,
-//       [response, batchId, email]
-//     );
-
-//     const label = response === 'interested' ? '✅ Interested' : '❌ Not Interested';
-//     const color = response === 'interested' ? '#22c55e' : '#ef4444';
-
-//     return res.send(`
-//       <html><body style="font-family:Arial;text-align:center;padding:60px;">
-//         <h2 style="color:${color};">${label}</h2>
-//         <p>Thank you! Your response has been recorded.</p>
-//       </body></html>
-//     `);
-
-//   } catch (err) {
-//     console.error('Track response error:', err);
-//     res.status(500).send(`
-//       <html><body style="font-family:Arial;text-align:center;padding:60px;">
-//         <h2>💥 Server Error</h2>
-//         <p>${err.message}</p>
-//       </body></html>
-//     `);
-//   }
-// });
 /* ─────────────────────────────────────────────
    START SERVER
 ───────────────────────────────────────────── */

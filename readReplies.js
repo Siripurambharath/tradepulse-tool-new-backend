@@ -9,12 +9,9 @@ const pool = mysql.createPool({
   password: '',
   database: 'seller_buyer_dummy',
 });
-
-
-
-async function saveReply({ batchId, historyId, productName, fromEmail, toEmail, subject, message }) {
+async function saveReply({ batchId, productName, fromEmail, toEmail, subject, message }) {
   const [existing] = await pool.query(
-    `SELECT id FROM email_replies
+    `SELECT id FROM email_history_companies
      WHERE batch_id = ? AND from_email = ? AND subject = ?
      LIMIT 1`,
     [batchId, fromEmail, subject]
@@ -25,16 +22,36 @@ async function saveReply({ batchId, historyId, productName, fromEmail, toEmail, 
     return false;
   }
 
+  // ✅ Fetch company details from original email using batch_id
+  const [originalRows] = await pool.query(
+    `SELECT company_name, country, contact_name, email 
+     FROM email_history_companies 
+     WHERE batch_id = ? 
+     LIMIT 1`,
+    [batchId]
+  );
+
+  let company_name = null, country = null, contact_name = null, email = null;
+  
+  if (originalRows.length > 0) {
+    company_name = originalRows[0].company_name;
+    country = originalRows[0].country;
+    contact_name = originalRows[0].contact_name;
+    email = originalRows[0].email;
+    console.log(`📋 Copied company details: ${company_name}, ${country}`);
+  }
+
   await pool.query(
-    `INSERT INTO email_replies
-      (batch_id, history_id, product_name, from_email, to_email, subject, message, reply_date)
-     VALUES (?, ?, ?, ?, ?, ?, ?, NOW())`,
-    [batchId, historyId, productName, fromEmail, toEmail, subject, message]
+    `INSERT INTO email_history_companies
+      (batch_id, company_name, country, contact_name, email, from_email, to_email, 
+       subject, message, product_name, reply_date, responded_at, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW(), 'replied')`,
+    [batchId, company_name, country, contact_name, email, fromEmail, toEmail, 
+     subject, message, productName]
   );
 
   return true;
 }
-
 function extractBatchId(parsed) {
   const subject = parsed.subject || '';
   let batchId = null;
@@ -106,11 +123,11 @@ function checkForReplies() {
   imap.once('ready', async () => {
     console.log('\n📬 Checking for email replies...');
 
-    // ✅ Step 1: Fetch all known batch_ids from email_history
+    // ✅ FIXED: Get batch_ids from email_history_companies
     let knownBatchIds = [];
     try {
       const [rows] = await pool.query(
-        'SELECT batch_id FROM email_history WHERE batch_id IS NOT NULL'
+        'SELECT DISTINCT batch_id FROM email_history_companies WHERE batch_id IS NOT NULL'
       );
       knownBatchIds = rows.map(r => r.batch_id);
       console.log(`📋 Found ${knownBatchIds.length} known batch(es) in DB`);
@@ -130,7 +147,6 @@ function checkForReplies() {
         return imap.end();
       }
 
-      // ✅ Step 2: Only fetch emails since earliest batch was sent
       const date = new Date();
       date.setDate(date.getDate() - 7);
       const sinceDate = date.toISOString().split('T')[0];
@@ -170,65 +186,59 @@ function checkForReplies() {
               console.log('From:   ', fromEmail);
               console.log('Subject:', subject);
 
-              // ✅ Skip own emails
               const fromAddress = (parsed.from?.value?.[0]?.address || '').toLowerCase();
               if (fromAddress === yourEmail) {
                 console.log(`⏭️  Skipped — your own email`);
                 return;
               }
 
-              // ✅ Skip non-replies
               if (!subject.toLowerCase().startsWith('re:')) {
                 console.log(`⏭️  Skipped — not a reply`);
                 return;
               }
 
-              const { batchId } = extractBatchId(parsed);
+              const { batchId, productName } = extractBatchId(parsed);
 
               if (!batchId) {
                 console.log(`❌ No batch ID found — skipping`);
                 return;
               }
 
-              // ✅ Step 3: Only process if batchId exists in our DB
               if (!knownBatchIds.includes(batchId)) {
                 console.log(`⏭️  Skipped — batchId ${batchId} not in our DB`);
                 return;
               }
 
-              // ✅ Step 4: Fetch id + product using batch_id (fixed column name)
-              const [historyRows] = await pool.query(
-                'SELECT id, product FROM email_history WHERE batch_id = ?',
+              // ✅ FIXED: Get company details from email_history_companies
+              const [companyRows] = await pool.query(
+                'SELECT company_name, country, contact_name, email, product_name FROM email_history_companies WHERE batch_id = ? LIMIT 1',
                 [batchId]
               );
 
-              let historyId   = null;
-              let productName = null;
+              let finalProductName = productName;
 
-              if (historyRows.length > 0) {
-                historyId   = historyRows[0].id;       // ✅ correct — auto increment id
-                productName = historyRows[0].product;
-                console.log(`📋 Matched history — id: ${historyId}, product: ${productName}`);
+              if (companyRows.length > 0) {
+                finalProductName = companyRows[0].product_name || productName;
+                console.log(`📋 Matched company — product: ${finalProductName}`);
               } else {
-                console.log(`⚠️ No history record found for batch_id: ${batchId}`);
-                return; // ✅ skip if no parent record
+                console.log(`⚠️ No company record found for batch_id: ${batchId}`);
+                return;
               }
 
               const messageText = parsed.text || parsed.html || '';
 
               try {
-                const wasSaved = await saveReply({
-                  batchId,
-                  historyId,
-                  productName,
-                  fromEmail,
-                  toEmail,
-                  subject,
-                  message: messageText,
-                });
+               const wasSaved = await saveReply({
+  batchId,
+  productName: finalProductName,
+  fromEmail,
+  toEmail,
+  subject,
+  message: messageText,
+});
 
                 if (wasSaved) {
-                  console.log(`✅ SAVED reply from ${fromEmail} → batch ${batchId} (history_id: ${historyId})`);
+                  console.log(`✅ SAVED reply from ${fromEmail} → batch ${batchId}`);
                   saved++;
                 }
               } catch (dbErr) {
