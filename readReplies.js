@@ -9,6 +9,7 @@ const pool = mysql.createPool({
   password: '',
   database: 'seller_buyer_dummy',
 });
+
 async function saveReply({ batchId, productName, fromEmail, toEmail, subject, message }) {
   const [existing] = await pool.query(
     `SELECT id FROM email_history_companies
@@ -22,9 +23,9 @@ async function saveReply({ batchId, productName, fromEmail, toEmail, subject, me
     return false;
   }
 
-  // ✅ Fetch company details from original email using batch_id
+  // Fetch ALL details from original email including template info and buyer_id
   const [originalRows] = await pool.query(
-    `SELECT company_name, country, contact_name, email 
+    `SELECT company_name, country, contact_name, email, template_used, template_id, product_name, buyer_id
      FROM email_history_companies 
      WHERE batch_id = ? 
      LIMIT 1`,
@@ -32,26 +33,34 @@ async function saveReply({ batchId, productName, fromEmail, toEmail, subject, me
   );
 
   let company_name = null, country = null, contact_name = null, email = null;
+  let template_used = null, template_id = null, buyer_id = null;
   
   if (originalRows.length > 0) {
     company_name = originalRows[0].company_name;
     country = originalRows[0].country;
     contact_name = originalRows[0].contact_name;
     email = originalRows[0].email;
+    template_used = originalRows[0].template_used;
+    template_id = originalRows[0].template_id;
+    buyer_id = originalRows[0].buyer_id;
     console.log(`📋 Copied company details: ${company_name}, ${country}`);
+    console.log(`📋 Template: ${template_used} (ID: ${template_id})`);
+    console.log(`📋 Buyer ID: ${buyer_id}`);
   }
 
   await pool.query(
     `INSERT INTO email_history_companies
-      (batch_id, company_name, country, contact_name, email, from_email, to_email, 
-       subject, message, product_name, reply_date, responded_at, status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW(), 'replied')`,
-    [batchId, company_name, country, contact_name, email, fromEmail, toEmail, 
-     subject, message, productName]
+      (batch_id, buyer_id, company_name, country, contact_name, email, from_email, to_email, 
+       subject, message, product_name, reply_date, responded_at, status, template_used, template_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW(), 'replied', ?, ?)`,
+    [batchId, buyer_id, company_name, country, contact_name, email, fromEmail, toEmail, 
+     subject, message, productName, template_used, template_id]
   );
 
+  console.log(`✅ Saved reply with buyer_id: ${buyer_id}`);
   return true;
 }
+
 function extractBatchId(parsed) {
   const subject = parsed.subject || '';
   let batchId = null;
@@ -123,7 +132,6 @@ function checkForReplies() {
   imap.once('ready', async () => {
     console.log('\n📬 Checking for email replies...');
 
-    // ✅ FIXED: Get batch_ids from email_history_companies
     let knownBatchIds = [];
     try {
       const [rows] = await pool.query(
@@ -209,9 +217,9 @@ function checkForReplies() {
                 return;
               }
 
-              // ✅ FIXED: Get company details from email_history_companies
+              // Get company details including buyer_id from email_history_companies
               const [companyRows] = await pool.query(
-                'SELECT company_name, country, contact_name, email, product_name FROM email_history_companies WHERE batch_id = ? LIMIT 1',
+                'SELECT company_name, country, contact_name, email, product_name, buyer_id FROM email_history_companies WHERE batch_id = ? LIMIT 1',
                 [batchId]
               );
 
@@ -220,6 +228,7 @@ function checkForReplies() {
               if (companyRows.length > 0) {
                 finalProductName = companyRows[0].product_name || productName;
                 console.log(`📋 Matched company — product: ${finalProductName}`);
+                console.log(`📋 Buyer ID from original: ${companyRows[0].buyer_id}`);
               } else {
                 console.log(`⚠️ No company record found for batch_id: ${batchId}`);
                 return;
@@ -228,14 +237,14 @@ function checkForReplies() {
               const messageText = parsed.text || parsed.html || '';
 
               try {
-               const wasSaved = await saveReply({
-  batchId,
-  productName: finalProductName,
-  fromEmail,
-  toEmail,
-  subject,
-  message: messageText,
-});
+                const wasSaved = await saveReply({
+                  batchId,
+                  productName: finalProductName,
+                  fromEmail,
+                  toEmail,
+                  subject,
+                  message: messageText,
+                });
 
                 if (wasSaved) {
                   console.log(`✅ SAVED reply from ${fromEmail} → batch ${batchId}`);
