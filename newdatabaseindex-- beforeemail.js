@@ -14,6 +14,7 @@ const app = express();
 
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 /* ─────────────────────────────────────────────
    MYSQL
@@ -27,69 +28,6 @@ const pool = mysql.createPool({
   waitForConnections: true,
   connectionLimit: 20,
 });
-
-/* ─────────────────────────────────────────────
-   FETCH EMAIL PROFILE BY SELLER ID
-───────────────────────────────────────────── */
-
-async function getEmailProfileBySellerId(sellerId) {
-  const [rows] = await pool.query(
-    `SELECT * FROM email_profiles 
-     WHERE seller_id = ? AND is_active = 1 
-     ORDER BY id DESC 
-     LIMIT 1`,
-    [sellerId]
-  );
-  if (!rows.length) {
-    throw new Error(`No active email profile found for seller_id: ${sellerId}`);
-  }
-  return rows[0];
-}
-
-/* ─────────────────────────────────────────────
-   CREATE TRANSPORTER FROM PROFILE
-───────────────────────────────────────────── */
-
-function createTransporterFromProfile(profile) {
-  if (profile.api_key) {
-    return nodemailer.createTransport({
-      host: profile.smtp_host || 'smtp.sendgrid.net',
-      port: profile.smtp_port || 587,
-      secure: false,
-      auth: {
-        user: 'apikey',
-        pass: profile.api_key,
-      },
-      tls: { rejectUnauthorized: false },
-    });
-  }
-
-  return nodemailer.createTransport({
-    host: profile.smtp_host,
-    port: profile.smtp_port || 587,
-    secure: profile.smtp_port === 465,
-    auth: {
-      user: profile.username,
-      pass: profile.password,
-    },
-    tls: { rejectUnauthorized: false },
-  });
-}
-
-/* ─────────────────────────────────────────────
-   TRANSPORTER CACHE (avoid rebuilding per job)
-───────────────────────────────────────────── */
-
-const transporterCache = new Map(); // profileId -> transporter
-
-function getCachedTransporter(profile) {
-  if (transporterCache.has(profile.id)) {
-    return transporterCache.get(profile.id);
-  }
-  const transporter = createTransporterFromProfile(profile);
-  transporterCache.set(profile.id, transporter);
-  return transporter;
-}
 
 /* ─────────────────────────────────────────────
    BULL QUEUE & EMAIL SETUP
@@ -110,6 +48,15 @@ const serverAdapter = new ExpressAdapter();
 serverAdapter.setBasePath('/admin/queues');
 createBullBoard({ queues: [new BullAdapter(emailQueue)], serverAdapter });
 app.use('/admin/queues', serverAdapter.getRouter());
+
+const transporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS,
+  },
+  tls: { rejectUnauthorized: false },
+});
 
 function buildHtml(message, product, interestedUrl, notInterestedUrl) {
   return `
@@ -140,12 +87,15 @@ function buildHtml(message, product, interestedUrl, notInterestedUrl) {
           ${message.replace(/\n/g, '<br/>')}
           <br/><br/>
           <p>Product/Service: <span class="product">${product}</span></p>
+
+          <!-- ✅ Tracking Buttons -->
           <p><strong>Are you interested in this product?</strong></p>
           <div class="btn-row">
             <a href="${interestedUrl}" class="btn btn-yes">✅ Interested</a>
             <a href="${notInterestedUrl}" class="btn btn-no">❌ Not Interested</a>
           </div>
           <p class="note">Clicking a button records your response. You can only respond once.</p>
+
           <br/>
           <p>Best regards,<br/>Trade Platform Team</p>
         </div>
@@ -157,10 +107,28 @@ function buildHtml(message, product, interestedUrl, notInterestedUrl) {
   `;
 }
 
-/* ─────────────────────────────────────────────
-   QUEUE PROCESSOR — uses per-job email profile
-───────────────────────────────────────────── */
 
+
+
+
+async function dbInsertCompanyRow(batchId, company, status) {
+  await pool.query(
+    `INSERT INTO email_history_companies
+      (batch_id, buyer_id, company_name, country, contact_name, email, sent_at, status, template_used)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      batchId,
+    company.buyer_id,
+      company.companyName,
+      company.country,     
+      company.contactName,
+      company.email,
+      new Date(),
+      status,
+      company.templateUsed,
+    ]
+  );
+}
 emailQueue.process(async (job) => {
   const {
     recipientEmail,
@@ -170,33 +138,26 @@ emailQueue.process(async (job) => {
     originalProduct,
     company,
     batchId,
-    sellerId,        // ✅ pulled from job data
-    emailProfile,
   } = job.data;
 
-  console.log(`Processing job for ${recipientEmail} in batch ${batchId} via profile ${emailProfile?.profile_name} (seller_id=${sellerId})`);
+  console.log(`Processing job for ${recipientEmail} in batch ${batchId}`);
 
+ 
   await job.progress(20);
 
-  const trackedSubject = `${subject || `Business Opportunity - ${product}`} [BATCH:${batchId}]`;
+const trackedSubject = `${subject || `Business Opportunity - ${product}`} [BATCH:${batchId}]`;
 
   let sendStatus = 'Sent';
   let sendError = null;
   let messageId = null;
 
   try {
-    if (!emailProfile) {
-      throw new Error('No email profile attached to job');
-    }
-
-    const transporter = getCachedTransporter(emailProfile);
-
     const BASE_URL = process.env.BASE_URL;
     const interestedUrl    = `${BASE_URL}/track-response?batchId=${batchId}&email=${encodeURIComponent(recipientEmail)}&response=interested`;
     const notInterestedUrl = `${BASE_URL}/track-response?batchId=${batchId}&email=${encodeURIComponent(recipientEmail)}&response=not_interested`;
 
     const info = await transporter.sendMail({
-      from: `"${emailProfile.sender_name}" <${emailProfile.sender_email}>`,
+      from: `"Trade Platform" <${process.env.EMAIL_USER}>`,
       to: recipientEmail,
       subject: trackedSubject,
       html: buildHtml(message, originalProduct, interestedUrl, notInterestedUrl),
@@ -208,7 +169,7 @@ emailQueue.process(async (job) => {
     });
 
     messageId = info.messageId;
-    console.log(`✅ Sent to ${recipientEmail} via ${emailProfile.sender_email} [${messageId}]`);
+    console.log(`✅ Sent to ${recipientEmail} [${messageId}]`);
     await job.progress(70);
 
   } catch (err) {
@@ -229,21 +190,21 @@ emailQueue.process(async (job) => {
       await pool.query(
         `UPDATE email_history_companies 
          SET sent_at = ?, status = ?, template_used = ?, template_id = ?, 
-             product_name = ?, multiple_products = ?, buyer_id = ?, seller_id = ?
+             product_name = ?, multiple_products = ?, buyer_id = ?
          WHERE batch_id = ? AND email = ?`,
-        [new Date(), sendStatus, company.templateUsed || 'Welcome Template',
+        [new Date(), sendStatus, company.templateUsed || 'Welcome Template', 
          company.templateId, originalProduct, job.data.multipleProducts || false,
-         company.buyer_id, sellerId, batchId, recipientEmail]   // ✅ seller_id added
+         company.buyer_id, batchId, recipientEmail]  // ✅ Add buyer_id
       );
     } else {
       await pool.query(
         `INSERT INTO email_history_companies
-          (batch_id, seller_id, buyer_id, company_name, country, contact_name, email, 
+          (batch_id, buyer_id, company_name, country, contact_name, email, 
            sent_at, status, template_used, template_id, product_name, multiple_products)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [batchId, sellerId, company.buyer_id, company.companyName || 'Unknown',   // ✅ seller_id added
-         company.country || null, company.contactName || company.companyName || 'Unknown',
-         recipientEmail, new Date(), sendStatus, company.templateUsed || 'Welcome Template',
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [batchId, company.buyer_id, company.companyName || 'Unknown', 
+         company.country || null, company.contactName || company.companyName || 'Unknown', 
+         recipientEmail, new Date(), sendStatus, company.templateUsed || 'Welcome Template', 
          company.templateId, originalProduct, job.data.multipleProducts || false]
       );
     }
@@ -255,35 +216,26 @@ emailQueue.process(async (job) => {
 
   return { recipientEmail, status: sendStatus, messageId };
 });
-
 emailQueue.on('completed', (job, result) => {
   console.log(`Job ${job.id} completed — ${result.recipientEmail} [${result.status}]`);
 });
 emailQueue.on('failed', (job, err) => {
   console.error(`Job ${job.id} failed — ${job.data.recipientEmail}: ${err.message}`);
 });
-
-/* ─────────────────────────────────────────────
-   /send-email — fetch profile, enqueue jobs
-───────────────────────────────────────────── */
-
 app.post('/send-email', async (req, res) => {
-  const { product, subject, message, historyPayload, seller_id } = req.body;
-
+  const { product, subject, message, historyPayload } = req.body;
+  console.log('Received /send-email request with payload:', req.body);
   console.log('═══════════════════════════════════════');
   console.log('📧 SEND EMAIL API - FULL REQUEST BODY');
   console.log('═══════════════════════════════════════');
   console.log(JSON.stringify(req.body, null, 2));
 
-  if (!seller_id) {
-    return res.status(400).json({ error: 'seller_id is required' });
-  }
-
+  
   if (!historyPayload) {
     return res.status(400).json({ error: 'historyPayload is required' });
   }
 
-  const { id: batchId, companies } = historyPayload;
+  const { id: batchId, date: batchDate, companies } = historyPayload;
 
   if (!batchId) {
     return res.status(400).json({ error: 'historyPayload.id (batchId) is required' });
@@ -293,36 +245,28 @@ app.post('/send-email', async (req, res) => {
     return res.status(400).json({ error: 'No recipients specified' });
   }
 
-  // Fetch the seller's active email profile BEFORE enqueuing
-  let emailProfile;
   try {
-    emailProfile = await getEmailProfileBySellerId(seller_id);
-    console.log(`📨 Using email profile: ${emailProfile.profile_name} (${emailProfile.sender_email})`);
-  } catch (err) {
-    console.error('Email profile fetch error:', err.message);
-    return res.status(404).json({ error: err.message });
-  }
+  
 
-  try {
+    console.log(`✅ Parent record created for batchId: ${batchId}`);
+
     const jobs = await Promise.all(
       companies.map((company, index) =>
-        emailQueue.add(
-          {
-            recipientEmail: company.email,
-            subject,
-            message,
-            product: product,
-            originalProduct: company.product,
-            company: {
-              ...company,
-              buyer_id: company.buyer_id,
-              templateId: company.templateId,
-            },
-            batchId,
-            sellerId: seller_id,   // ✅ attached to every job
-            multipleProducts: req.body.multipleProducts || false,
-            emailProfile,
-          },
+emailQueue.add(
+  {
+    recipientEmail: company.email,
+    subject,
+    message,
+    product: product,                   
+    originalProduct: company.product,     
+    company: {
+          ...company,
+          buyer_id: company.buyer_id, 
+          templateId: company.templateId 
+    },
+    batchId,
+    multipleProducts: req.body.multipleProducts || false,
+  },
           {
             attempts: 3,
             backoff: { type: 'exponential', delay: 3000 },
@@ -335,7 +279,7 @@ app.post('/send-email', async (req, res) => {
     );
 
     const jobIds = jobs.map((j) => j.id.toString());
-    console.log(`Enqueued ${jobIds.length} jobs for batch ${batchId} using seller ${seller_id}`);
+    console.log(`Enqueued ${jobIds.length} jobs for batch ${batchId}`);
     res.json({ batchId, jobIds, total: jobIds.length });
 
   } catch (err) {
@@ -343,11 +287,6 @@ app.post('/send-email', async (req, res) => {
     res.status(500).json({ error: 'Failed to enqueue jobs', details: err.message });
   }
 });
-
-/* ─────────────────────────────────────────────
-   BATCH STATUS
-───────────────────────────────────────────── */
-
 app.get('/batch-status/:batchId', async (req, res) => {
   const jobIdsParam = req.query.jobIds;
   if (!jobIdsParam) {
@@ -399,9 +338,10 @@ app.get('/batch-status/:batchId', async (req, res) => {
   }
 });
 
-/* ─────────────────────────────────────────────
-   BUYERS / FILTERS / TEMPLATES
-───────────────────────────────────────────── */
+
+
+
+
 
 app.get("/buyers", async (req, res) => {
   try {
@@ -472,6 +412,10 @@ app.get("/buyers", async (req, res) => {
   }
 });
 
+/* ─────────────────────────────────────────────
+   FILTERS
+───────────────────────────────────────────── */
+
 app.get("/filters/buyer-countries", async (req, res) => {
   try {
     const [rows] = await pool.query(`
@@ -499,12 +443,6 @@ app.get("/filters/products", async (req, res) => {
 });
 
 app.get('/history', async (req, res) => {
-  const { seller_id } = req.query;
-console.log('GET /history called with seller_id:', seller_id);
-  if (!seller_id) {
-    return res.status(400).json({ error: 'seller_id is required' });
-  }
-
   try {
     const [batches] = await pool.query(`
       SELECT DISTINCT
@@ -514,10 +452,9 @@ console.log('GET /history called with seller_id:', seller_id);
         MAX(multiple_products) as multiple_products,
         MAX(CASE WHEN template_used IS NOT NULL THEN template_used END) as template_used
       FROM email_history_companies
-      WHERE seller_id = ?
       GROUP BY batch_id
       ORDER BY MAX(sent_at) DESC
-    `, [seller_id]);
+    `);
 
     // For each batch, get its companies data
     const historyData = await Promise.all(
@@ -539,10 +476,10 @@ console.log('GET /history called with seller_id:', seller_id);
             reply_date,
             subject
           FROM email_history_companies
-          WHERE batch_id = ? AND seller_id = ?
+          WHERE batch_id = ?
           ORDER BY sent_at DESC
           `,
-          [batch.batch_id, seller_id]
+          [batch.batch_id]
         );
 
         if (!results.length) return null;
@@ -906,12 +843,6 @@ app.delete("/email-templates/:id", async (req, res) => {
 });
 
 app.get('/api/replyhistory', async (req, res) => {
-  const { seller_id } = req.query;
-
-  if (!seller_id) {
-    return res.status(400).json({ success: false, message: "seller_id is required" });
-  }
-
   try {
     // Get only records that are either 'interested' OR have a reply (message is not null)
     const query = `
@@ -930,7 +861,6 @@ app.get('/api/replyhistory', async (req, res) => {
         MAX(COALESCE(reply_date, responded_at, sent_at)) as last_interaction
       FROM email_history_companies
       WHERE buyer_id IS NOT NULL
-        AND seller_id = ?
         AND (
           LOWER(response) = 'interested' 
           OR (message IS NOT NULL AND message != '')
@@ -939,7 +869,7 @@ app.get('/api/replyhistory', async (req, res) => {
       ORDER BY last_interaction DESC
     `;
 
-    const [groupedResults] = await pool.query(query, [seller_id]);
+    const [groupedResults] = await pool.query(query);
 
     if (groupedResults.length === 0) {
       return res.status(404).json({ success: false, message: "No interested or replied contacts found" });
@@ -1181,21 +1111,16 @@ app.get('/api/replyhistory/:id', async (req, res) => {
 
 
 app.get('/api/tracking/counts', async (req, res) => {
-  const { seller_id } = req.query;
-
-  if (!seller_id) {
-    return res.status(400).json({ success: false, error: 'seller_id is required' });
-  }
 
   try {
+
     // 1. SENT count - unique companies that have at least one sent email
     const [sentCount] = await pool.query(`
       SELECT COUNT(DISTINCT buyer_id) as count
       FROM email_history_companies
       WHERE status = 'sent'
         AND buyer_id IS NOT NULL
-        AND seller_id = ?
-    `, [seller_id]);
+    `);
 
     // 2. REPLIED count - unique companies that have at least one reply
     const [repliedCount] = await pool.query(`
@@ -1205,8 +1130,7 @@ app.get('/api/tracking/counts', async (req, res) => {
         AND message != ''
         AND reply_date IS NOT NULL
         AND buyer_id IS NOT NULL
-        AND seller_id = ?
-    `, [seller_id]);
+    `);
 
     // 3. INTERESTED count - unique companies that have at least one 'interested' response
     const [interestedCount] = await pool.query(`
@@ -1214,8 +1138,7 @@ app.get('/api/tracking/counts', async (req, res) => {
       FROM email_history_companies
       WHERE response = 'interested'
         AND buyer_id IS NOT NULL
-        AND seller_id = ?
-    `, [seller_id]);
+    `);
 
     // 4. NOT INTERESTED count - unique companies that have at least one 'not_interested' response
     const [notInterestedCount] = await pool.query(`
@@ -1223,26 +1146,24 @@ app.get('/api/tracking/counts', async (req, res) => {
       FROM email_history_companies
       WHERE response = 'not_interested'
         AND buyer_id IS NOT NULL
-        AND seller_id = ?
-    `, [seller_id]);
+    `);
 
-    // 5. NOT CONTACTED count - buyers with no email history FROM THIS SELLER
+    // 5. NOT CONTACTED count - buyers with no email history
     const [notContactedCount] = await pool.query(`
       SELECT COUNT(*) as count
       FROM buyers b
       WHERE NOT EXISTS (
         SELECT 1 FROM email_history_companies ehc 
-        WHERE ehc.buyer_id = b.id AND ehc.seller_id = ?
+        WHERE ehc.buyer_id = b.id
       )
-    `, [seller_id]);
+    `);
 
-    // 6. Total unique companies contacted (have any email history) by this seller
+    // 6. Total unique companies contacted (have any email history)
     const [totalContacted] = await pool.query(`
       SELECT COUNT(DISTINCT buyer_id) as count
       FROM email_history_companies
       WHERE buyer_id IS NOT NULL
-        AND seller_id = ?
-    `, [seller_id]);
+    `);
 
     res.json({
       success: true,
@@ -1262,15 +1183,10 @@ app.get('/api/tracking/counts', async (req, res) => {
     console.error('GET /api/tracking/counts error:', err);
     res.status(500).json({ success: false, error: err.message });
   }
+
 });
 
 app.get('/api/tracking/all', async (req, res) => {
-  const { seller_id } = req.query;
-
-  if (!seller_id) {
-    return res.status(400).json({ success: false, error: 'seller_id is required' });
-  }
-
   try {
     // 1. SENT - Group by buyer_id with interaction count
     const [sentEmails] = await pool.query(`
@@ -1288,10 +1204,9 @@ app.get('/api/tracking/all', async (req, res) => {
         'sent' as current_status
       FROM email_history_companies
       WHERE status = 'sent'
-        AND seller_id = ?
       GROUP BY buyer_id
       ORDER BY last_interaction DESC
-    `, [seller_id]);
+    `);
 
     // 2. REPLIED - Group by buyer_id with interaction count
     const [repliedEmails] = await pool.query(`
@@ -1310,10 +1225,9 @@ app.get('/api/tracking/all', async (req, res) => {
       WHERE message IS NOT NULL 
         AND message != ''
         AND reply_date IS NOT NULL
-        AND seller_id = ?
       GROUP BY buyer_id
       ORDER BY last_interaction DESC
-    `, [seller_id]);
+    `);
 
     // 3. INTERESTED - Group by buyer_id with interaction count
     const [interestedEmails] = await pool.query(`
@@ -1330,10 +1244,9 @@ app.get('/api/tracking/all', async (req, res) => {
         'interested' as current_status
       FROM email_history_companies
       WHERE response = 'interested'
-        AND seller_id = ?
       GROUP BY buyer_id
       ORDER BY last_interaction DESC
-    `, [seller_id]);
+    `);
 
     // 4. NOT INTERESTED - Group by buyer_id with interaction count
     const [notInterestedEmails] = await pool.query(`
@@ -1350,12 +1263,11 @@ app.get('/api/tracking/all', async (req, res) => {
         'not_interested' as current_status
       FROM email_history_companies
       WHERE response = 'not_interested'
-        AND seller_id = ?
       GROUP BY buyer_id
       ORDER BY last_interaction DESC
-    `, [seller_id]);
+    `);
 
-    // 5. NOT CONTACTED - Buyers with no email history FROM THIS SELLER
+    // 5. NOT CONTACTED - Buyers with no email history
     const [notContacted] = await pool.query(`
       SELECT DISTINCT
         b.id as buyer_id,
@@ -1374,11 +1286,11 @@ app.get('/api/tracking/all', async (req, res) => {
       LEFT JOIN buyer_contacts bc ON b.id = bc.buyer_id
       WHERE NOT EXISTS (
         SELECT 1 FROM email_history_companies ehc 
-        WHERE ehc.buyer_id = b.id AND ehc.seller_id = ?
+        WHERE ehc.buyer_id = b.id
       )
       GROUP BY b.id
       ORDER BY b.company_name
-    `, [seller_id]);
+    `);
 
     // Get detailed counts (total interactions per status, not unique buyers)
     const [detailedCounts] = await pool.query(`
@@ -1388,8 +1300,7 @@ app.get('/api/tracking/all', async (req, res) => {
         SUM(CASE WHEN response = 'interested' THEN 1 ELSE 0 END) as total_interested,
         SUM(CASE WHEN response = 'not_interested' THEN 1 ELSE 0 END) as total_not_interested
       FROM email_history_companies
-      WHERE seller_id = ?
-    `, [seller_id]);
+    `);
 
     // Get unique buyer counts
     const [uniqueBuyerCounts] = await pool.query(`
@@ -1399,8 +1310,7 @@ app.get('/api/tracking/all', async (req, res) => {
         COUNT(DISTINCT CASE WHEN response = 'interested' THEN buyer_id END) as unique_interested_buyers,
         COUNT(DISTINCT CASE WHEN response = 'not_interested' THEN buyer_id END) as unique_not_interested_buyers
       FROM email_history_companies
-      WHERE seller_id = ?
-    `, [seller_id]);
+    `);
 
     // Get not contacted count
     const [notContactedCount] = await pool.query(`
@@ -1408,9 +1318,9 @@ app.get('/api/tracking/all', async (req, res) => {
       FROM buyers b
       WHERE NOT EXISTS (
         SELECT 1 FROM email_history_companies ehc 
-        WHERE ehc.buyer_id = b.id AND ehc.seller_id = ?
+        WHERE ehc.buyer_id = b.id
       )
-    `, [seller_id]);
+    `);
 
     res.json({
       success: true,
@@ -1422,12 +1332,14 @@ app.get('/api/tracking/all', async (req, res) => {
         notContacted: notContacted
       },
       counts: {
+        // Total interactions (email counts)
         totalSent: detailedCounts[0]?.total_sent || 0,
         totalReplied: detailedCounts[0]?.total_replied || 0,
         totalInterested: detailedCounts[0]?.total_interested || 0,
         totalNotInterested: detailedCounts[0]?.total_not_interested || 0,
         totalNotContacted: notContactedCount[0]?.count || 0,
         
+        // Unique buyer counts
         uniqueBuyers: {
           sent: uniqueBuyerCounts[0]?.unique_sent_buyers || 0,
           replied: uniqueBuyerCounts[0]?.unique_replied_buyers || 0,
@@ -1863,82 +1775,39 @@ app.put("/api/email-configurations/:sellerId", async (req, res) => {
       senderEmail,
       smtpHost,
       smtpPort,
-      imapHost,
-      imapPort,
       username,
       password,
       apiKey,
     } = req.body;
 
-    if (!profileName || !provider || !senderEmail || !username) {
-      return res.status(400).json({
-        success: false,
-        message: "profileName, provider, senderEmail, and username are required",
-      });
-    }
-
-    const [existing] = await pool.execute(
-      `SELECT id FROM email_profiles WHERE seller_id = ? LIMIT 1`,
-      [sellerId]
+    await pool.execute(
+      `
+      UPDATE email_profiles
+      SET
+        profile_name=?,
+        provider=?,
+        sender_name=?,
+        sender_email=?,
+        smtp_host=?,
+        smtp_port=?,
+        username=?,
+        password=?,
+        api_key=?
+      WHERE seller_id=?
+      `,
+      [
+        profileName,
+        provider,
+        senderName,
+        senderEmail,
+        smtpHost,
+        smtpPort,
+        username,
+        password,
+        apiKey,
+        sellerId,
+      ]
     );
-
-    if (existing.length > 0) {
-      await pool.execute(
-        `
-        UPDATE email_profiles
-        SET
-          profile_name=?,
-          provider=?,
-          sender_name=?,
-          sender_email=?,
-          smtp_host=?,
-          smtp_port=?,
-          imap_host=?,
-          imap_port=?,
-          username=?,
-          password=?,
-          api_key=?
-        WHERE seller_id=?
-        `,
-        [
-          profileName,
-          provider,
-          senderName,
-          senderEmail,
-          smtpHost || null,
-          smtpPort || null,
-          imapHost || null,
-          imapPort || null,
-          username,
-          password || null,
-          apiKey || null,
-          sellerId,
-        ]
-      );
-    } else {
-      await pool.execute(
-        `
-        INSERT INTO email_profiles
-          (seller_id, profile_name, provider, sender_name, sender_email,
-           smtp_host, smtp_port, imap_host, imap_port, username, password, api_key, is_active)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-        `,
-        [
-          sellerId,
-          profileName,
-          provider,
-          senderName,
-          senderEmail,
-          smtpHost || null,
-          smtpPort || null,
-          imapHost || null,
-          imapPort || null,
-          username,
-          password || null,
-          apiKey || null,
-        ]
-      );
-    }
 
     res.json({
       success: true,
@@ -1953,6 +1822,7 @@ app.put("/api/email-configurations/:sellerId", async (req, res) => {
     });
   }
 });
+
 /* ─────────────────────────────────────────────
    START SERVER
 ───────────────────────────────────────────── */
@@ -1963,6 +1833,8 @@ checkForReplies();
 setInterval(() => {
   checkForReplies();
 }, 2 * 60 * 1000);
+
+
 
 app.listen(5000, () => {
   console.log(`Server running on port 5000`);
