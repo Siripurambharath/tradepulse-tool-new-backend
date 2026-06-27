@@ -23,7 +23,7 @@ const pool = mysql.createPool({
   host: "localhost",
   user: "root",
   password: "",
-  database: "seller_buyer_dummy_old",
+  database: "seller_buyer_dummy",
   waitForConnections: true,
   connectionLimit: 20,
 });
@@ -500,7 +500,8 @@ app.get("/filters/products", async (req, res) => {
 
 app.get('/history', async (req, res) => {
   const { seller_id } = req.query;
-console.log('GET /history called with seller_id:', seller_id);
+  console.log('GET /history called with seller_id:', seller_id);
+  
   if (!seller_id) {
     return res.status(400).json({ error: 'seller_id is required' });
   }
@@ -553,8 +554,20 @@ console.log('GET /history called with seller_id:', seller_id);
           replied: results.filter(row => row.message && row.message.trim() !== '').length,
           interested: results.filter(row => row.response === 'interested').length,
           notInterested: results.filter(row => row.response === 'not_interested').length,
-          emailSent: results.filter(row => row.status === 'sent').length
+          emailSent: results.filter(row => row.status === 'sent' || row.response === null).length
         };
+
+        // FILTER: Remove entries that have ANY non-interested responses along with interested responses
+        // This means: if there's at least one interested AND (any not_interested OR any null response OR any email sent)
+        const hasNonInterested = results.some(row => 
+          row.response === 'not_interested' || 
+          row.response === null || 
+          row.status === 'sent'
+        );
+        
+        if (counts.interested > 0 && hasNonInterested) {
+          return null; // Remove this batch
+        }
 
         const companies = results.map((row) => {
           let displayStatus = 'Email Sent';
@@ -599,7 +612,7 @@ console.log('GET /history called with seller_id:', seller_id);
       })
     );
 
-    // Filter out any null results and send response
+    // Filter out any null results
     const filteredData = historyData.filter(item => item !== null);
     
     // Remove duplicates by batch_id
@@ -636,8 +649,9 @@ app.post('/api/store-response', async (req, res) => {
     country, 
     contactName, 
     productName,
-    templateUsed ,
-    buyer_id  
+    templateUsed,
+    buyer_id,
+    seller_id  // Add this to the destructuring
   } = req.body;
 
   // Validation
@@ -651,15 +665,20 @@ app.post('/api/store-response', async (req, res) => {
   try {
     const batchId = generateUUID();
     const yourEmail = process.env.EMAIL_USER;
+    
+    // Get seller_id from request or fallback to null
+    const sellerId = seller_id || null;
+    
     const [result] = await pool.query(
       `INSERT INTO email_history_companies 
-        (batch_id, buyer_id, company_name, country, contact_name, email, 
+        (batch_id, buyer_id, seller_id, company_name, country, contact_name, email, 
          response, responded_at, product_name, template_used, status,
          from_email, to_email)
-       VALUES (?, ?, ?,?, ?, ?, ?, NOW(), ?, ?, 'responded', ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?, 'responded', ?, ?)`,
       [
         batchId,
         buyer_id || null,
+        sellerId,  // Add seller_id here
         companyName || null,
         country || null,
         contactName || null,
@@ -675,6 +694,8 @@ app.post('/api/store-response', async (req, res) => {
     console.log('✅ New response stored:', {
       id: result.insertId,
       batchId,
+      seller_id: sellerId,
+      buyer_id: buyer_id,
       email,
       response,
       from_email: email,
@@ -688,7 +709,8 @@ app.post('/api/store-response', async (req, res) => {
       data: {
         id: result.insertId,
         batchId: batchId,
-         buyer_id: buyer_id,
+        seller_id: sellerId,
+        buyer_id: buyer_id,
         email: email,
         response: response,
         from_email: email,
@@ -905,7 +927,7 @@ app.delete("/email-templates/:id", async (req, res) => {
   }
 });
 
-app.get('/api/replyhistory', async (req, res) => {
+app.get('/api/contacts', async (req, res) => {
   const { seller_id } = req.query;
 
   if (!seller_id) {
@@ -987,16 +1009,26 @@ app.get('/api/replyhistory', async (req, res) => {
 });
 
 
-// Get detailed history for a specific buyer
+// Get detailed history for a specific buyer (filtered by seller)
 app.get('/api/replyhistory/:buyerId', async (req, res) => {
   try {
     const buyerId = req.params.buyerId;
-    
+    const sellerId = req.query.sellerId; // Get sellerId from query params
+
+    // Validate sellerId
+    if (!sellerId) {
+      return res.status(400).json({
+        success: false,
+        message: "sellerId is required"
+      });
+    }
+
     const query = `
       SELECT 
         id,
         batch_id,
         buyer_id,
+        seller_id,
         from_email,
         to_email,
         subject,
@@ -1012,16 +1044,16 @@ app.get('/api/replyhistory/:buyerId', async (req, res) => {
         responded_at,
         sent_at
       FROM email_history_companies
-      WHERE buyer_id = ?
+      WHERE buyer_id = ? AND seller_id = ?
       ORDER BY COALESCE(reply_date, responded_at, sent_at) DESC
     `;
 
-    const [results] = await pool.query(query, [buyerId]);
+    const [results] = await pool.query(query, [buyerId, sellerId]);
 
     if (results.length === 0) {
-      return res.status(404).json({ 
-        success: false, 
-        message: "Contact not found" 
+      return res.status(404).json({
+        success: false,
+        message: "No replies found for this buyer and seller"
       });
     }
 
@@ -1069,6 +1101,7 @@ app.get('/api/replyhistory/:buyerId', async (req, res) => {
       return {
         id: reply.id,
         batch_id: reply.batch_id,
+        seller_id: reply.seller_id,
         buyer_id: reply.buyer_id,
         from_email: reply.from_email,
         to_email: reply.to_email,
@@ -1087,97 +1120,99 @@ app.get('/api/replyhistory/:buyerId', async (req, res) => {
       };
     });
 
-    res.json({ 
-      success: true, 
-      count: cleanedResults.length, 
-      data: cleanedResults 
+    res.json({
+      success: true,
+      count: cleanedResults.length,
+      data: cleanedResults
     });
 
   } catch (error) {
     console.error("Error fetching buyer details:", error);
-    res.status(500).json({ 
-      success: false, 
-      message: "Error fetching buyer details", 
-      error: error.message 
+    res.status(500).json({
+      success: false,
+      message: "Error fetching buyer details",
+      error: error.message
     });
   }
 });
-app.get('/api/replyhistory/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
 
-    const query = `
-      SELECT 
-        id,
-        batch_id,
-        from_email,
-        to_email,
-        subject,
-        message,
-        product_name,
-        reply_date,
-        company_name,
-        contact_name,
-        country,
-        status,
-        template_used,
-        response,
-        responded_at,
-        sent_at
-      FROM email_history_companies
-      WHERE id = ?
-      LIMIT 1
-    `;
 
-    const [results] = await pool.query(query, [id]);
+// app.get('/api/replyhistory/:id', async (req, res) => {
+//   try {
+//     const { id } = req.params;
 
-    if (results.length === 0) {
-      return res.status(404).json({ success: false, message: "Email reply not found" });
-    }
+//     const query = `
+//       SELECT 
+//         id,
+//         batch_id,
+//         from_email,
+//         to_email,
+//         subject,
+//         message,
+//         product_name,
+//         reply_date,
+//         company_name,
+//         contact_name,
+//         country,
+//         status,
+//         template_used,
+//         response,
+//         responded_at,
+//         sent_at
+//       FROM email_history_companies
+//       WHERE id = ?
+//       LIMIT 1
+//     `;
 
-    const reply = results[0];
+//     const [results] = await pool.query(query, [id]);
 
-    let cleanedSubject = reply.subject || '';
-    cleanedSubject = cleanedSubject.replace(/\s*\[BATCH:[^\]]+\]/g, '');
-    cleanedSubject = cleanedSubject.replace(/^Re:\s*/, '');
+//     if (results.length === 0) {
+//       return res.status(404).json({ success: false, message: "Email reply not found" });
+//     }
 
-    let cleanedMessage = reply.message;
-    const onIndex = cleanedMessage.indexOf('\nOn');
-    if (onIndex !== -1) {
-      cleanedMessage = cleanedMessage.substring(0, onIndex).trim();
-    }
+//     const reply = results[0];
 
-    cleanedMessage = cleanedMessage
-      .replace(/\\u003C/g, '<')
-      .replace(/\\u003E/g, '>')
-      .trim();
+//     let cleanedSubject = reply.subject || '';
+//     cleanedSubject = cleanedSubject.replace(/\s*\[BATCH:[^\]]+\]/g, '');
+//     cleanedSubject = cleanedSubject.replace(/^Re:\s*/, '');
 
-    res.json({
-      success: true,
-      data: {
-        id: reply.id,
-        batch_id: reply.batch_id,
-        from_email: reply.from_email,
-        to_email: reply.to_email,
-        subject: cleanedSubject,
-        message: cleanedMessage,
-        product_name: reply.product_name,
-        reply_date: reply.reply_date,
-        company_name: reply.company_name,
-        contact_name: reply.contact_name,
-        country: reply.country,
-        status: reply.status,
-        template_used: reply.template_used,
-        response: reply.response,
-        responded_at: reply.responded_at
-      }
-    });
+//     let cleanedMessage = reply.message;
+//     const onIndex = cleanedMessage.indexOf('\nOn');
+//     if (onIndex !== -1) {
+//       cleanedMessage = cleanedMessage.substring(0, onIndex).trim();
+//     }
 
-  } catch (error) {
-    console.error("Error fetching email reply:", error);
-    res.status(500).json({ success: false, message: "Error fetching email reply", error: error.message });
-  }
-});
+//     cleanedMessage = cleanedMessage
+//       .replace(/\\u003C/g, '<')
+//       .replace(/\\u003E/g, '>')
+//       .trim();
+
+//     res.json({
+//       success: true,
+//       data: {
+//         id: reply.id,
+//         batch_id: reply.batch_id,
+//         from_email: reply.from_email,
+//         to_email: reply.to_email,
+//         subject: cleanedSubject,
+//         message: cleanedMessage,
+//         product_name: reply.product_name,
+//         reply_date: reply.reply_date,
+//         company_name: reply.company_name,
+//         contact_name: reply.contact_name,
+//         country: reply.country,
+//         status: reply.status,
+//         template_used: reply.template_used,
+//         response: reply.response,
+//         responded_at: reply.responded_at
+//       }
+//     });
+
+//   } catch (error) {
+//     console.error("Error fetching email reply:", error);
+//     res.status(500).json({ success: false, message: "Error fetching email reply", error: error.message });
+//   }
+// });
 
 
 app.get('/api/tracking/counts', async (req, res) => {
@@ -1444,11 +1479,19 @@ app.get('/api/tracking/all', async (req, res) => {
   }
 });
 
-
 app.get('/api/tracking/buyer/:id', async (req, res) => {
   const buyerId = req.params.id;
+  const sellerId = req.query.sellerId; // Get sellerId from query params
   
   try {
+    // Validate sellerId
+    if (!sellerId) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'sellerId is required' 
+      });
+    }
+
     // 1. Get buyer basic information
     const [buyerInfoResult] = await pool.query(`
       SELECT 
@@ -1474,7 +1517,7 @@ app.get('/api/tracking/buyer/:id', async (req, res) => {
 
     const buyerInfo = buyerInfoResult[0];
 
-    // 2. Get ALL communications for this buyer from email_history_companies
+    // 2. Get ALL communications for this buyer filtered by seller_id
     const [communications] = await pool.query(`
       SELECT 
         id,
@@ -1494,11 +1537,12 @@ app.get('/api/tracking/buyer/:id', async (req, res) => {
         status,
         template_used,
         response,
+        seller_id,
         'email' as record_type
       FROM email_history_companies
-      WHERE buyer_id = ?
+      WHERE buyer_id = ? AND seller_id = ?
       ORDER BY COALESCE(sent_at, reply_date, responded_at) DESC
-    `, [buyerId]);
+    `, [buyerId, sellerId]);
 
     // 3. Process and clean the communications
     const processedCommunications = communications.map(comm => {
@@ -1551,7 +1595,7 @@ app.get('/api/tracking/buyer/:id', async (req, res) => {
       };
     });
 
-    // 4. Calculate summary statistics
+    // 4. Calculate summary statistics (only for this seller's communications)
     const summary = {
       total: processedCommunications.length,
       sent: processedCommunications.filter(c => c.display_status === 'Sent').length,
@@ -1572,7 +1616,8 @@ app.get('/api/tracking/buyer/:id', async (req, res) => {
         contact_name: buyerInfo.contacts?.split(',')[0]?.trim() || 'N/A',
         email: buyerInfo.emails?.split(',')[0]?.trim() || 'N/A',
         all_emails: buyerInfo.emails,
-        all_contacts: buyerInfo.contacts
+        all_contacts: buyerInfo.contacts,
+        seller_id: sellerId // Add current seller_id
       },
       summary: summary
     });
@@ -1585,8 +1630,6 @@ app.get('/api/tracking/buyer/:id', async (req, res) => {
     });
   }
 });
-
-
 app.get('/track-response', async (req, res) => {
   const { batchId, email, response } = req.query;
 

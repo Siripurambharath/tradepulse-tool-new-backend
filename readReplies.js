@@ -7,7 +7,7 @@ const pool = mysql.createPool({
   host: 'localhost',
   user: 'root',
   password: '',
-  database: 'seller_buyer_dummy_old',
+  database: 'seller_buyer_dummy',
 });
 
 function resolveImapSettings(profile) {
