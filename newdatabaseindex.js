@@ -10,6 +10,10 @@ const { checkForReplies } = require('./readReplies');
 const jwt = require("jsonwebtoken");
 require('dotenv').config();
 
+// Import buyer routes
+const buyerRoutes = require('./routes/buyerRoutes');
+const bulkBuyerRoutes = require('./routes/bulkBuyerRoutes'); 
+
 const app = express();
 
 app.use(cors());
@@ -26,7 +30,11 @@ const pool = mysql.createPool({
   database: "seller_buyer_dummy",
   waitForConnections: true,
   connectionLimit: 20,
+  port:4306
 });
+
+// Make pool available to routes
+app.set('pool', pool);
 
 /* ─────────────────────────────────────────────
    FETCH EMAIL PROFILE BY SELLER ID
@@ -1996,6 +2004,15 @@ app.put("/api/email-configurations/:sellerId", async (req, res) => {
     });
   }
 });
+
+/* ─────────────────────────────────────────────
+   BUYER ROUTES - Add this at the bottom, before the server start
+───────────────────────────────────────────── */
+
+// Use the buyer routes
+app.use('/', buyerRoutes);
+app.use('/', bulkBuyerRoutes);
+
 /* ─────────────────────────────────────────────
    START SERVER
 ───────────────────────────────────────────── */
