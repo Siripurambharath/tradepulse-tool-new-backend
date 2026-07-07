@@ -1868,6 +1868,65 @@ app.post("/api/seller/login", async (req, res) => {
   }
 });
 
+// Add this endpoint after the /api/seller/login endpoint
+
+// ============================================
+// API: Store User in Local Database
+// ============================================
+app.post("/api/store-user", async (req, res) => {
+  try {
+    const { id, email, password, role } = req.body;
+
+    if (!id || !email || !password) {
+      return res.status(400).json({
+        success: false,
+        message: "id, email and password are required",
+      });
+    }
+
+    // Check existing user
+    const [existing] = await pool.execute(
+      "SELECT user_id FROM users WHERE email = ?",
+      [email]
+    );
+
+    if (existing.length > 0) {
+      return res.status(200).json({
+        success: true,
+        exists: true,
+        message: "User already exists",
+      });
+    }
+
+    const [result] = await pool.execute(
+      `INSERT INTO users
+      (id, email, password, role, email_sent, email_config)
+      VALUES (?, ?, ?, ?, 0, 0)`,
+      [
+        id,
+        email,
+        password,
+        role || "seller"
+      ]
+    );
+
+    res.json({
+      success: true,
+      message: "User stored successfully",
+      user_id: result.insertId,
+      id,
+    });
+
+  } catch (err) {
+    console.error(err);
+
+    res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
+
 app.get("/api/email-configurations/:sellerId", async (req, res) => {
   try {
     const { sellerId } = req.params;

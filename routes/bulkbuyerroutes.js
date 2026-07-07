@@ -19,6 +19,28 @@ const BUYER_DIR = path.join(UPLOADS_ROOT, "buyers");
 });
 
 /* ===============================
+   DEFINED COLUMN HEADERS (Template Schema)
+================================ */
+const REQUIRED_COLUMNS = [
+  "product",
+  "hsn_code",
+  "country",
+  "company_name",
+  "website",
+  "buyer_date",
+  "address",
+  "additional_details",
+  "suggested_keywords",
+  "hsn_descriptions",
+  "confidence_level",
+  "reason",
+  "classification_notes",
+  "manual_verification",
+  "contact_numbers",
+  "emails"
+];
+
+/* ===============================
    MULTER (EXCEL UPLOAD ONLY)
 ================================ */
 const excelStorage = multer.diskStorage({
@@ -46,7 +68,7 @@ router.get("/api/buyers/bulk/download-template", (req, res) => {
         website: "https://example.com",
         buyer_date: "2025-11-29",
         address: "",
-        details: "",
+        additional_details: "",
         suggested_keywords: "",
         hsn_descriptions: "",
         confidence_level: "Medium",
@@ -64,7 +86,7 @@ router.get("/api/buyers/bulk/download-template", (req, res) => {
         website: "https://example2.com",
         buyer_date: "2025-11-29",
         address: "",
-        details: "",
+        additional_details: "",
         suggested_keywords: "",
         hsn_descriptions: "",
         confidence_level: "High",
@@ -88,7 +110,7 @@ router.get("/api/buyers/bulk/download-template", (req, res) => {
       { wch: 25 }, // website
       { wch: 15 }, // buyer_date
       { wch: 30 }, // address
-      { wch: 40 }, // details
+      { wch: 40 }, // additional_details
       { wch: 30 }, // suggested_keywords
       { wch: 30 }, // hsn_descriptions
       { wch: 12 }, // confidence_level
@@ -122,11 +144,40 @@ router.get("/api/buyers/bulk/download-template", (req, res) => {
 });
 
 /* ===============================
-   CHECK DUPLICATE FUNCTION
+   VALIDATE SCHEMA FUNCTION
 ================================ */
-const checkDuplicate = async (connection, product, company_name, contactNumbers, emails) => {
+const validateSchema = (headers) => {
+  const normalizedHeaders = headers.map(h => h.toLowerCase().trim());
+  
+  const missingColumns = REQUIRED_COLUMNS.filter(
+    required => !normalizedHeaders.includes(required.toLowerCase())
+  );
+  
+  const extraColumns = normalizedHeaders.filter(
+    header => !REQUIRED_COLUMNS.map(c => c.toLowerCase()).includes(header)
+  );
+  
+  const missingOriginal = REQUIRED_COLUMNS.filter(
+    required => !headers.some(h => h.toLowerCase().trim() === required.toLowerCase())
+  );
+  
+  const extraOriginal = headers.filter(
+    header => !REQUIRED_COLUMNS.some(required => required.toLowerCase() === header.toLowerCase().trim())
+  );
+  
+  return {
+    isValid: missingColumns.length === 0 && extraColumns.length === 0,
+    missingColumns: missingOriginal,
+    extraColumns: extraOriginal,
+  };
+};
+
+/* ===============================
+   CHECK DUPLICATE FUNCTION - IMPROVED
+================================ */
+const checkDuplicate = async (connection, product, company_name, newContactNumbers, newEmails) => {
   try {
-    // Check if product and company_name already exist
+    // Find existing buyers with same product and company name
     const [existingBuyers] = await connection.query(
       `SELECT id FROM buyers WHERE product = ? AND company_name = ?`,
       [product, company_name]
@@ -136,42 +187,43 @@ const checkDuplicate = async (connection, product, company_name, contactNumbers,
       return null; // No duplicate found
     }
 
-    const buyerId = existingBuyers[0].id;
-    let hasMatchingContact = false;
-    let hasMatchingEmail = false;
+    // Check each existing buyer
+    for (const buyer of existingBuyers) {
+      const buyerId = buyer.id;
 
-    // Check if any contact number matches
-    if (contactNumbers.length > 0) {
+      // Get existing contacts for this buyer
       const [existingContacts] = await connection.query(
-        `SELECT contact_number FROM buyer_contacts WHERE buyer_id = ? AND contact_number IN (?)`,
-        [buyerId, contactNumbers]
+        `SELECT contact_number FROM buyer_contacts WHERE buyer_id = ?`,
+        [buyerId]
       );
-      if (existingContacts.length > 0) {
-        hasMatchingContact = true;
-      }
-    }
+      const existingContactNumbers = existingContacts.map(c => c.contact_number);
 
-    // Check if any email matches
-    if (emails.length > 0) {
+      // Get existing emails for this buyer
       const [existingEmails] = await connection.query(
-        `SELECT email FROM buyer_emails WHERE buyer_id = ? AND email IN (?)`,
-        [buyerId, emails]
+        `SELECT email FROM buyer_emails WHERE buyer_id = ?`,
+        [buyerId]
       );
-      if (existingEmails.length > 0) {
-        hasMatchingEmail = true;
+      const existingEmailAddresses = existingEmails.map(e => e.email);
+
+      // Check if ALL new contacts match ALL existing contacts (in any order)
+      // AND ALL new emails match ALL existing emails (in any order)
+      const contactsMatch = newContactNumbers.length === existingContactNumbers.length &&
+        newContactNumbers.every(contact => existingContactNumbers.includes(contact));
+
+      const emailsMatch = newEmails.length === existingEmailAddresses.length &&
+        newEmails.every(email => existingEmailAddresses.includes(email));
+
+      // If both contacts and emails match exactly, it's a duplicate
+      if (contactsMatch && emailsMatch) {
+        return {
+          exists: true,
+          buyerId: buyerId,
+          message: `Duplicate found: Product "${product}" with Company "${company_name}" already exists with same contacts and emails`
+        };
       }
     }
 
-    // If both product/company match and at least one contact or email matches
-    if (hasMatchingContact || hasMatchingEmail) {
-      return {
-        exists: true,
-        buyerId: buyerId,
-        message: `Duplicate found: Product "${product}" with Company "${company_name}" already exists with matching contact/email`
-      };
-    }
-
-    return null;
+    return null; // No exact duplicate found
   } catch (error) {
     console.error("❌ Error checking duplicate:", error);
     throw error;
@@ -191,7 +243,6 @@ router.post(
     let skippedCount = 0;
     
     try {
-      // Get connection from pool
       connection = await pool.getConnection();
       await connection.beginTransaction();
 
@@ -213,8 +264,25 @@ router.post(
         });
       }
 
+      const headers = Object.keys(rows[0]);
+      const schemaValidation = validateSchema(headers);
+      
+      if (!schemaValidation.isValid) {
+        if (req.file && req.file.path && fs.existsSync(req.file.path)) {
+          fs.unlinkSync(req.file.path);
+        }
+        
+        return res.status(400).json({
+          success: false,
+          schemaMismatch: true,
+          message: "Schema mismatch detected. Please download the template and use the exact column headers.",
+          missingColumns: schemaValidation.missingColumns,
+          extraColumns: schemaValidation.extraColumns
+        });
+      }
+
       for (const row of rows) {
-        // Extract fields
+        const additional_details = String(row.additional_details || row.details || "").trim();
         const product = String(row.product || "").trim();
         const hsn_code = String(row.hsn_code || "").trim();
         const country = String(row.country || "").trim();
@@ -222,7 +290,6 @@ router.post(
         const website = String(row.website || "").trim();
         const buyer_date = row.buyer_date || null;
         const address = String(row.address || "").trim();
-        const details = String(row.details || "").trim();
         const suggested_keywords = String(row.suggested_keywords || "").trim();
         const hsn_descriptions = String(row.hsn_descriptions || "").trim();
         const confidence_level = String(row.confidence_level || "Medium").trim();
@@ -230,25 +297,25 @@ router.post(
         const classification_notes = String(row.classification_notes || "").trim();
         const manual_verification = String(row.manual_verification || "Pending").trim();
 
-        // Extract contacts and emails (comma separated)
         const contactNumbers = String(row.contact_numbers || "").trim()
           .split(",")
           .map(c => c.trim())
-          .filter(c => c.length > 0);
+          .filter(c => c.length > 0)
+          .sort(); // Sort for consistent comparison
 
         const emails = String(row.emails || "").trim()
           .split(",")
           .map(e => e.trim())
-          .filter(e => e.length > 0);
+          .filter(e => e.length > 0)
+          .sort(); // Sort for consistent comparison
 
-        // Validate required fields
         if (!product || !company_name) {
           console.warn("⚠️ Skipping row: Missing product or company_name");
           skippedCount++;
           continue;
         }
 
-        // Check for duplicates (product + company_name + matching contact/email)
+        // Check for duplicates
         const duplicateCheck = await checkDuplicate(connection, product, company_name, contactNumbers, emails);
         
         if (duplicateCheck) {
@@ -260,7 +327,7 @@ router.post(
             message: duplicateCheck.message
           });
           skippedCount++;
-          continue; // Skip this row
+          continue;
         }
 
         // Insert into buyers table
@@ -273,7 +340,7 @@ router.post(
             website,
             buyer_date,
             address,
-            details,
+            additional_details,
             suggested_keywords,
             hsn_descriptions,
             confidence_level,
@@ -289,7 +356,7 @@ router.post(
             website || null,
             buyer_date || null,
             address || null,
-            details || null,
+            additional_details || null,
             suggested_keywords || null,
             hsn_descriptions || null,
             confidence_level,
@@ -301,7 +368,6 @@ router.post(
 
         const buyerId = buyerResult.insertId;
 
-        // Insert contacts
         if (contactNumbers.length > 0) {
           const contactValues = contactNumbers.map(contact => [buyerId, contact]);
           await connection.query(
@@ -310,7 +376,6 @@ router.post(
           );
         }
 
-        // Insert emails
         if (emails.length > 0) {
           const emailValues = emails.map(email => [buyerId, email]);
           await connection.query(
@@ -324,12 +389,10 @@ router.post(
 
       await connection.commit();
 
-      // Clean up uploaded file
       if (req.file && req.file.path && fs.existsSync(req.file.path)) {
         fs.unlinkSync(req.file.path);
       }
 
-      // Prepare response with duplicate information
       const response = {
         success: true,
         message: "Bulk upload completed",
@@ -355,7 +418,6 @@ router.post(
       }
       console.error("❌ Bulk upload error:", err);
       
-      // Clean up uploaded file even on error
       if (req.file && req.file.path && fs.existsSync(req.file.path)) {
         try {
           fs.unlinkSync(req.file.path);
@@ -388,8 +450,8 @@ router.get("/api/buyers/bulk/all", async (req, res) => {
     const [buyers] = await pool.query(`
       SELECT 
         b.*,
-        GROUP_CONCAT(DISTINCT bc.contact_number) as contacts,
-        GROUP_CONCAT(DISTINCT be.email) as emails
+        GROUP_CONCAT(DISTINCT bc.contact_number ORDER BY bc.contact_number) as contacts,
+        GROUP_CONCAT(DISTINCT be.email ORDER BY be.email) as emails
       FROM buyers b
       LEFT JOIN buyer_contacts bc ON b.id = bc.buyer_id
       LEFT JOIN buyer_emails be ON b.id = be.buyer_id
@@ -397,14 +459,16 @@ router.get("/api/buyers/bulk/all", async (req, res) => {
       ORDER BY b.id DESC
     `);
 
-    // Parse contacts and emails into arrays
     const formattedBuyers = buyers.map(buyer => ({
       ...buyer,
-      contacts: buyer.contacts ? buyer.contacts.split(',') : [],
-      emails: buyer.emails ? buyer.emails.split(',') : [],
+      contacts: buyer.contacts ? buyer.contacts.split(',').sort() : [],
+      emails: buyer.emails ? buyer.emails.split(',').sort() : [],
     }));
 
-    res.json(formattedBuyers);
+    res.json({
+      success: true,
+      data: formattedBuyers
+    });
   } catch (err) {
     console.error("❌ Fetch buyers error:", err);
     res.status(500).json({
@@ -436,12 +500,12 @@ router.get("/api/buyers/bulk/:id", async (req, res) => {
     const buyer = buyerRows[0];
 
     const [contacts] = await pool.query(
-      `SELECT contact_number FROM buyer_contacts WHERE buyer_id = ?`,
+      `SELECT contact_number FROM buyer_contacts WHERE buyer_id = ? ORDER BY contact_number`,
       [id]
     );
 
     const [emails] = await pool.query(
-      `SELECT email FROM buyer_emails WHERE buyer_id = ?`,
+      `SELECT email FROM buyer_emails WHERE buyer_id = ? ORDER BY email`,
       [id]
     );
 
@@ -481,7 +545,7 @@ router.put("/api/buyers/bulk/:id", async (req, res) => {
       website,
       buyer_date,
       address,
-      details,
+      additional_details,
       suggested_keywords,
       hsn_descriptions,
       confidence_level,
@@ -492,7 +556,6 @@ router.put("/api/buyers/bulk/:id", async (req, res) => {
       emails,
     } = req.body;
 
-    // Update buyer
     await connection.query(
       `UPDATE buyers SET
         product = ?,
@@ -502,7 +565,7 @@ router.put("/api/buyers/bulk/:id", async (req, res) => {
         website = ?,
         buyer_date = ?,
         address = ?,
-        details = ?,
+        additional_details = ?,
         suggested_keywords = ?,
         hsn_descriptions = ?,
         confidence_level = ?,
@@ -518,7 +581,7 @@ router.put("/api/buyers/bulk/:id", async (req, res) => {
         website || null,
         buyer_date || null,
         address || null,
-        details || null,
+        additional_details || null,
         suggested_keywords || null,
         hsn_descriptions || null,
         confidence_level || "Medium",
@@ -529,11 +592,9 @@ router.put("/api/buyers/bulk/:id", async (req, res) => {
       ]
     );
 
-    // Delete old contacts and emails
     await connection.query(`DELETE FROM buyer_contacts WHERE buyer_id = ?`, [id]);
     await connection.query(`DELETE FROM buyer_emails WHERE buyer_id = ?`, [id]);
 
-    // Insert new contacts
     if (contacts && Array.isArray(contacts) && contacts.length > 0) {
       const contactValues = contacts
         .filter(c => c.trim())
@@ -547,7 +608,6 @@ router.put("/api/buyers/bulk/:id", async (req, res) => {
       }
     }
 
-    // Insert new emails
     if (emails && Array.isArray(emails) && emails.length > 0) {
       const emailValues = emails
         .filter(e => e.trim())
@@ -603,7 +663,6 @@ router.delete("/api/buyers/bulk/:id", async (req, res) => {
 
     const { id } = req.params;
 
-    // Delete related records first
     await connection.query(`DELETE FROM buyer_contacts WHERE buyer_id = ?`, [id]);
     await connection.query(`DELETE FROM buyer_emails WHERE buyer_id = ?`, [id]);
     await connection.query(`DELETE FROM buyers WHERE id = ?`, [id]);

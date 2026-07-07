@@ -32,7 +32,7 @@ router.post('/api/buyers', async (req, res) => {
       company_name,
       website,
       address,
-      details,
+      additional_details,  // Changed from details
       suggested_keywords,
       hsn_descriptions,
       confidence_level,
@@ -70,7 +70,7 @@ router.post('/api/buyers', async (req, res) => {
     // Start transaction
     await connection.beginTransaction();
 
-    // 1. Insert into buyers table
+    // 1. Insert into buyers table - Updated column name
     const buyerQuery = `
       INSERT INTO buyers (
         product,
@@ -79,7 +79,7 @@ router.post('/api/buyers', async (req, res) => {
         company_name,
         website,
         address,
-        details,
+        additional_details,  -- Changed from details
         suggested_keywords,
         hsn_descriptions,
         confidence_level,
@@ -98,7 +98,7 @@ router.post('/api/buyers', async (req, res) => {
       company_name,
       website || null,
       address || null,
-      details || null,
+      additional_details || null,  // Changed from details
       suggested_keywords || null,
       hsn_descriptions || null,
       confidence_level || null,
@@ -157,7 +157,7 @@ router.post('/api/buyers', async (req, res) => {
         b.company_name,
         b.website,
         b.address,
-        b.details,
+        b.additional_details,  -- Changed from details
         b.suggested_keywords,
         b.hsn_descriptions,
         b.confidence_level,
@@ -225,7 +225,7 @@ router.get('/api/buyers', async (req, res) => {
         b.company_name,
         b.website,
         b.address,
-        b.details,
+        b.additional_details,  -- Changed from details
         b.suggested_keywords,
         b.hsn_descriptions,
         b.confidence_level,
@@ -307,7 +307,7 @@ router.get('/api/buyers/:id', async (req, res) => {
         b.company_name,
         b.website,
         b.address,
-        b.details,
+        b.additional_details,  -- Changed from details
         b.suggested_keywords,
         b.hsn_descriptions,
         b.confidence_level,
@@ -374,7 +374,7 @@ router.put('/api/buyers/:id', async (req, res) => {
       company_name,
       website,
       address,
-      details,
+      additional_details,  // Changed from details
       suggested_keywords,
       hsn_descriptions,
       confidence_level,
@@ -397,7 +397,7 @@ router.put('/api/buyers/:id', async (req, res) => {
     // Start transaction
     await connection.beginTransaction();
 
-    // 1. Update buyers table
+    // 1. Update buyers table - Updated column name
     const buyerQuery = `
       UPDATE buyers SET
         product = ?,
@@ -406,7 +406,7 @@ router.put('/api/buyers/:id', async (req, res) => {
         company_name = ?,
         website = ?,
         address = ?,
-        details = ?,
+        additional_details = ?,  -- Changed from details
         suggested_keywords = ?,
         hsn_descriptions = ?,
         confidence_level = ?,
@@ -424,7 +424,7 @@ router.put('/api/buyers/:id', async (req, res) => {
       company_name,
       website || null,
       address || null,
-      details || null,
+      additional_details || null,  // Changed from details
       suggested_keywords || null,
       hsn_descriptions || null,
       confidence_level || null,
@@ -486,7 +486,7 @@ router.put('/api/buyers/:id', async (req, res) => {
         b.company_name,
         b.website,
         b.address,
-        b.details,
+        b.additional_details,  -- Changed from details
         b.suggested_keywords,
         b.hsn_descriptions,
         b.confidence_level,
