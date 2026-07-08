@@ -9,8 +9,7 @@ const { ExpressAdapter } = require('@bull-board/express');
 // const { checkForReplies } = require('./readReplies');
 const jwt = require("jsonwebtoken");
 require('dotenv').config();
-const buyerRoutes = require('./routes/buyerRoutes');
-const bulkBuyerRoutes = require('./routes/bulkBuyerRoutes'); 
+
 const app = express();
 
 app.use(cors());
@@ -24,11 +23,11 @@ const pool = mysql.createPool({
   host: "localhost",
   user: "root",
   password: "",
-  database: "seller_buyer_dummy",
+  database: "seller_buyer_dummy_old",
   waitForConnections: true,
   connectionLimit: 20,
 });
-app.set('pool', pool);
+
 /* ─────────────────────────────────────────────
    FETCH EMAIL PROFILE BY SELLER ID
 ───────────────────────────────────────────── */
@@ -1888,59 +1887,6 @@ app.post("/api/seller/login", async (req, res) => {
     });
   }
 });
-app.post("/api/store-user", async (req, res) => {
-  try {
-    const { id, email, password, role } = req.body;
-
-    if (!id || !email || !password) {
-      return res.status(400).json({
-        success: false,
-        message: "id, email and password are required",
-      });
-    }
-
-    // Check existing user
-    const [existing] = await pool.execute(
-      "SELECT user_id FROM users WHERE email = ?",
-      [email]
-    );
-
-    if (existing.length > 0) {
-      return res.status(200).json({
-        success: true,
-        exists: true,
-        message: "User already exists",
-      });
-    }
-
-    const [result] = await pool.execute(
-      `INSERT INTO users
-      (id, email, password, role, email_sent, email_config)
-      VALUES (?, ?, ?, ?, 0, 0)`,
-      [
-        id,
-        email,
-        password,
-        role || "seller"
-      ]
-    );
-
-    res.json({
-      success: true,
-      message: "User stored successfully",
-      user_id: result.insertId,
-      id,
-    });
-
-  } catch (err) {
-    console.error(err);
-
-    res.status(500).json({
-      success: false,
-      message: err.message,
-    });
-  }
-});
 
 app.get("/api/email-configurations/:sellerId", async (req, res) => {
   try {
@@ -2245,8 +2191,89 @@ app.get("/status/:userId", async (req, res) => {
   }
 });
 
-app.use('/', buyerRoutes);
-app.use('/', bulkBuyerRoutes);
+app.post("/store-login", (req, res) => {
+  const { id, email, password, role } = req.body;
+
+  console.log("Received store-login request:", req.body);
+
+  if (!id || !email || !password || !role) {
+    return res.status(400).json({
+      success: false,
+      message: "Required fields are missing.",
+    });
+  }
+
+  pool.query(
+    "SELECT * FROM users WHERE id = ?",
+    [id],
+    (err, results) => {
+      if (err) {
+        console.log("SELECT ERROR:", err);
+        return res.status(500).json({
+          success: false,
+          message: err.message,
+        });
+      }
+
+      console.log("SELECT RESULTS:", results);
+
+      // Update existing user
+      if (results.length > 0) {
+        pool.query(
+          `UPDATE users
+           SET email=?,
+               password=?,
+               role=?,
+               email_sent=0,
+               email_config=1
+           WHERE id=?`,
+          [email, password, role, id],
+          (err, result) => {
+            if (err) {
+              console.log("UPDATE ERROR:", err);
+              return res.status(500).json({
+                success: false,
+                message: err.message,
+              });
+            }
+
+            console.log("UPDATE RESULT:", result);
+
+            return res.json({
+              success: true,
+              message: "User updated successfully.",
+            });
+          }
+        );
+      } else {
+        // Insert new user
+        pool.query(
+          `INSERT INTO users
+          (id, email, password, role, email_sent, email_config)
+          VALUES (?, ?, ?, ?, ?, ?)`,
+          [String(id), email, password, role, 0, 1],
+          (err, result) => {
+            if (err) {
+              console.log("INSERT ERROR:", err);
+              return res.status(500).json({
+                success: false,
+                message: err.message,
+              });
+            }
+
+            console.log("INSERT RESULT:", result);
+
+            return res.json({
+              success: true,
+              message: "User stored successfully.",
+            });
+          }
+        );
+      }
+    }
+  );
+});
+
 /* ─────────────────────────────────────────────
    START SERVER
 ───────────────────────────────────────────── */
