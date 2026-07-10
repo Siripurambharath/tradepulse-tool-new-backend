@@ -549,7 +549,6 @@ app.get('/history', async (req, res) => {
       ORDER BY MAX(sent_at) DESC
     `, [seller_id]);
 
-    // For each batch, get its companies data
     const historyData = await Promise.all(
       batches.map(async (batch) => {
         const [results] = await pool.query(
@@ -577,7 +576,7 @@ app.get('/history', async (req, res) => {
 
         if (!results.length) return null;
 
-        // Fix counts logic
+        // Calculate counts
         const counts = {
           total: results.length,
           replied: results.filter(row => row.message && row.message.trim() !== '').length,
@@ -586,27 +585,34 @@ app.get('/history', async (req, res) => {
           emailSent: results.filter(row => row.status === 'sent' || row.response === null).length
         };
 
-        // FILTER: Remove entries that have ANY non-interested responses along with interested responses
-        // This means: if there's at least one interested AND (any not_interested OR any null response OR any email sent)
-        const hasNonInterested = results.some(row => 
-          row.response === 'not_interested' || 
-          row.response === null || 
-          row.status === 'sent'
-        );
-        
-        if (counts.interested > 0 && hasNonInterested) {
-          return null; // Remove this batch
-        }
-
+        // ✅ FIX: Build companies array with combined statuses
         const companies = results.map((row) => {
           let displayStatus = 'Email Sent';
-          
-          if (row.response === 'interested') {
-            displayStatus = 'Interested';
-          } else if (row.response === 'not_interested') {
-            displayStatus = 'Not Interested';
-          } else if (row.message && row.message.trim() !== '') {
+
+          const hasMessage = row.message && row.message.trim() !== '';
+          const isInterested = row.response === 'interested';
+          const isNotInterested = row.response === 'not_interested';
+
+          // ✅ Handle ALL combinations
+          if (hasMessage && isInterested) {
+            displayStatus = 'Replied, Interested';
+          } else if (hasMessage && isNotInterested) {
+            displayStatus = 'Replied, Not Interested';
+          } else if (hasMessage) {
             displayStatus = 'Replied';
+          } else if (isInterested) {
+            displayStatus = 'Interested';
+          } else if (isNotInterested) {
+            displayStatus = 'Not Interested';
+          }
+
+          // Clean the message - take only the first line
+          let cleanedMessage = null;
+          let cleanedSubject = row.subject;
+          
+          if (row.message && row.message.trim() !== '') {
+            const firstLine = row.message.split('\n')[0];
+            cleanedMessage = firstLine.trim();
           }
 
           return {
@@ -618,13 +624,16 @@ app.get('/history', async (req, res) => {
             respondedAt: row.reply_date || row.responded_at,
             status: displayStatus,
             templateUsed: row.template_used,
-            subject: row.subject,
-            message: row.message,
-            product: row.product
+            subject: cleanedSubject,
+            message: cleanedMessage,
+            product: row.product,
+            // Add individual flags for frontend
+            hasReply: hasMessage,
+            isInterested: isInterested,
+            isNotInterested: isNotInterested
           };
         });
 
-        // Determine main product display
         let mainProduct = results[0]?.product || batch.product_name;
         if (batch.multiple_products === 1) {
           mainProduct = "General Products";
@@ -636,12 +645,19 @@ app.get('/history', async (req, res) => {
           multiple_products: batch.multiple_products,
           date: batch.sent_at,
           companies,
-          counts
+          counts,
+          summary: {
+            hasInterested: counts.interested > 0,
+            hasReplied: counts.replied > 0,
+            hasNotInterested: counts.notInterested > 0,
+            allSent: counts.emailSent === counts.total,
+            allReplied: counts.replied === counts.total
+          }
         };
       })
     );
 
-    // Filter out any null results
+    // Filter out null results
     const filteredData = historyData.filter(item => item !== null);
     
     // Remove duplicates by batch_id
@@ -653,14 +669,28 @@ app.get('/history', async (req, res) => {
       return acc;
     }, []);
 
-    res.json(uniqueData);
+    // Sort by date (newest first) and then by priority (interested first)
+    uniqueData.sort((a, b) => {
+      const dateCompare = new Date(b.date) - new Date(a.date);
+      if (dateCompare !== 0) return dateCompare;
+      
+      if (a.counts.interested > 0 && b.counts.interested === 0) return -1;
+      if (a.counts.interested === 0 && b.counts.interested > 0) return 1;
+      
+      return 0;
+    });
+
+    res.json({
+      success: true,
+      total: uniqueData.length,
+      data: uniqueData
+    });
 
   } catch (err) {
     console.error('GET /history error:', err);
     res.status(500).json({ error: err.message });
   }
 });
-
 // Add this helper function at the top of your server.js
 function generateUUID() {
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
@@ -758,7 +788,6 @@ app.post('/api/store-response', async (req, res) => {
 });
 
 
-
 app.get('/history/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -787,6 +816,8 @@ app.get('/history/:id', async (req, res) => {
       [id]
     );
 
+    console.log(`Found ${results.length} records for batch ${id}`);
+
     if (!results.length) {
       return res.status(404).json({
         success: false,
@@ -794,6 +825,7 @@ app.get('/history/:id', async (req, res) => {
       });
     }
 
+    // Calculate counts
     const counts = {
       total: results.length,
       replied: 0,
@@ -802,42 +834,47 @@ app.get('/history/:id', async (req, res) => {
       emailSent: 0
     };
 
-    // If any row in the batch contains a message
-    counts.replied = results.some(
-      row => row.message && row.message.trim() !== ''
-    ) ? 1 : 0;
-
     results.forEach((row) => {
+      if (row.message && row.message.trim() !== '') {
+        counts.replied++;
+      }
       if (row.response === 'interested') {
         counts.interested++;
       }
-
       if (row.response === 'not_interested') {
         counts.notInterested++;
       }
-
-      if (row.status === 'sent') {
+      if (row.status === 'sent' || row.response === null) {
         counts.emailSent++;
       }
     });
 
+    // Build companies array
     const companies = results.map((row) => {
       let displayStatus = 'Email Sent';
 
-      if (row.message && row.message.trim() !== '') {
+      const hasMessage = row.message && row.message.trim() !== '';
+      const isInterested = row.response === 'interested';
+      const isNotInterested = row.response === 'not_interested';
+
+      // ✅ Handle ALL combinations
+      if (hasMessage && isInterested) {
+        displayStatus = 'Replied, Interested';
+      } else if (hasMessage && isNotInterested) {
+        displayStatus = 'Replied, Not Interested';
+      } else if (hasMessage) {
         displayStatus = 'Replied';
-      } else if (row.response === 'interested') {
+      } else if (isInterested) {
         displayStatus = 'Interested';
-      } else if (row.response === 'not_interested') {
+      } else if (isNotInterested) {
         displayStatus = 'Not Interested';
       }
 
-      // Clean the message - take only the first line before any newline
-      let cleanedMessage = row.message;
+      // Clean the message - take only the first line
+      let cleanedMessage = null;
       let cleanedSubject = row.subject;
       
       if (row.message && row.message.trim() !== '') {
-        // Get the first line only (before first newline)
         const firstLine = row.message.split('\n')[0];
         cleanedMessage = firstLine.trim();
       }
@@ -852,12 +889,16 @@ app.get('/history/:id', async (req, res) => {
         status: displayStatus,
         templateUsed: row.template_used,
         subject: cleanedSubject,
-        message: cleanedMessage,  // Will be "bharath new" only
-        product: row.product
+        message: cleanedMessage,
+        product: row.product,
+        // Add individual flags for frontend
+        hasReply: hasMessage,
+        isInterested: isInterested,
+        isNotInterested: isNotInterested
       };
     });
 
-    // Get multiple_products value from first row (same for all in batch)
+    // Get multiple_products value from first row
     const multipleProducts = results[0].multiple_products;
 
     // Determine main product display
@@ -883,6 +924,13 @@ app.get('/history/:id', async (req, res) => {
     });
   }
 });
+
+
+// Add this endpoint after the /api/seller/login endpoint
+
+// ============================================
+// API: Store User in Local Database
+// ============================================
 
 
 app.get('/history/:id/replies', async (req, res) => {
@@ -2213,6 +2261,7 @@ app.post("/api/send-test-email/:sellerId", async (req, res) => {
     }
 
 });
+
 
 // routes/email.js
 

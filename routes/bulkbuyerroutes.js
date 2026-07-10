@@ -4,8 +4,7 @@ const multer = require("multer");
 const XLSX = require("xlsx");
 const path = require("path");
 const fs = require("fs");
-const pool = require("../db"); // Import the pool directly
-
+let pool;
 /* ===============================
    PATH CONFIG
 ================================ */
