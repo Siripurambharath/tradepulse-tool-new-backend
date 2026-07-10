@@ -9,13 +9,104 @@ let pool;
 router.use((req, res, next) => {
   pool = req.app.get('pool');
   if (!pool) {
-    return res.status(500).json({ 
-      success: false, 
-      message: 'Database connection not available' 
+    return res.status(500).json({
+      success: false,
+      message: 'Database connection not available'
     });
   }
   next();
 });
+
+/**
+ * Check for a duplicate buyer.
+ * A buyer is considered a duplicate when product + company_name match an
+ * existing row AND that existing row's full set of contact numbers and
+ * full set of emails exactly match (order-insensitive) the new ones.
+ *
+ * This mirrors the duplicate-detection logic used by the bulk upload route
+ * (routes/bulkBuyerRoutes.js) so single-add / edit and bulk-upload behave
+ * consistently.
+ *
+ * @param {object} connection - active mysql connection/pool connection
+ * @param {string} product
+ * @param {string} company_name
+ * @param {string[]} newContactNumbers - trimmed, non-empty contact numbers
+ * @param {string[]} newEmails - trimmed, non-empty emails
+ * @param {number|string|null} excludeId - buyer id to exclude (used on update, so a
+ *        buyer is not compared against itself)
+ * @returns {Promise<{exists: boolean, buyerId: number, message: string}|null>}
+ */
+const checkDuplicateBuyer = async (
+  connection,
+  product,
+  company_name,
+  newContactNumbers,
+  newEmails,
+  excludeId = null
+) => {
+  try {
+    let query = `SELECT id FROM buyers WHERE product = ? AND company_name = ?`;
+    const params = [product, company_name];
+
+    if (excludeId) {
+      query += ` AND id != ?`;
+      params.push(excludeId);
+    }
+
+    const [existingBuyers] = await connection.query(query, params);
+
+    if (existingBuyers.length === 0) {
+      return null; // No buyer with same product + company_name at all
+    }
+
+    const sortedNewContacts = [...newContactNumbers].sort();
+    const sortedNewEmails = [...newEmails].sort();
+
+    for (const buyer of existingBuyers) {
+      const buyerId = buyer.id;
+
+      // Existing contacts for this buyer
+      const [existingContacts] = await connection.query(
+        'SELECT contact_number FROM buyer_contacts WHERE buyer_id = ?',
+        [buyerId]
+      );
+      const existingContactNumbers = existingContacts
+        .map((c) => c.contact_number)
+        .sort();
+
+      // Existing emails for this buyer
+      const [existingEmails] = await connection.query(
+        'SELECT email FROM buyer_emails WHERE buyer_id = ?',
+        [buyerId]
+      );
+      const existingEmailAddresses = existingEmails
+        .map((e) => e.email)
+        .sort();
+
+      // Full set match, in any order
+      const contactsMatch =
+        sortedNewContacts.length === existingContactNumbers.length &&
+        sortedNewContacts.every((c) => existingContactNumbers.includes(c));
+
+      const emailsMatch =
+        sortedNewEmails.length === existingEmailAddresses.length &&
+        sortedNewEmails.every((e) => existingEmailAddresses.includes(e));
+
+      if (contactsMatch && emailsMatch) {
+        return {
+          exists: true,
+          buyerId,
+          message: `A buyer with product "${product}" and company "${company_name}" already exists with the same contact numbers and emails.`
+        };
+      }
+    }
+
+    return null; // Same product/company exists, but contacts/emails differ -> not a duplicate
+  } catch (error) {
+    console.error('Error checking duplicate buyer:', error);
+    throw error;
+  }
+};
 
 /**
  * POST /api/buyers
@@ -23,7 +114,7 @@ router.use((req, res, next) => {
  */
 router.post('/api/buyers', async (req, res) => {
   const connection = await pool.getConnection();
-  
+
   try {
     const {
       product,
@@ -66,6 +157,33 @@ router.post('/api/buyers', async (req, res) => {
         message: 'At least one email address is required'
       });
     }
+
+    // Normalize contacts/emails the same way bulk upload does, for duplicate comparison
+    const normalizedContacts = contacts
+      .filter((c) => c.contact_number && c.contact_number.trim())
+      .map((c) => c.contact_number.trim());
+
+    const normalizedEmails = emails
+      .filter((e) => e.email && e.email.trim())
+      .map((e) => e.email.trim());
+
+    // ---- Duplicate check (mirrors bulk upload logic) ----
+    const duplicateCheck = await checkDuplicateBuyer(
+      connection,
+      product,
+      company_name,
+      normalizedContacts,
+      normalizedEmails
+    );
+
+    if (duplicateCheck) {
+      return res.status(409).json({
+        success: false,
+        duplicate: true,
+        message: duplicateCheck.message
+      });
+    }
+    // ---- End duplicate check ----
 
     // Start transaction
     await connection.beginTransaction();
@@ -116,7 +234,7 @@ router.post('/api/buyers', async (req, res) => {
         INSERT INTO buyer_contacts (buyer_id, contact_number) 
         VALUES (?, ?)
       `;
-      
+
       for (const contact of contacts) {
         if (contact.contact_number && contact.contact_number.trim()) {
           await connection.execute(contactQuery, [
@@ -133,7 +251,7 @@ router.post('/api/buyers', async (req, res) => {
         INSERT INTO buyer_emails (buyer_id, email) 
         VALUES (?, ?)
       `;
-      
+
       for (const email of emails) {
         if (email.email && email.email.trim()) {
           await connection.execute(emailQuery, [
@@ -195,7 +313,7 @@ router.post('/api/buyers', async (req, res) => {
   } catch (error) {
     // Rollback transaction on error
     await connection.rollback();
-    
+
     console.error('Error adding buyer:', error);
     res.status(500).json({
       success: false,
@@ -364,7 +482,7 @@ router.get('/api/buyers/:id', async (req, res) => {
  */
 router.put('/api/buyers/:id', async (req, res) => {
   const connection = await pool.getConnection();
-  
+
   try {
     const { id } = req.params;
     const {
@@ -393,6 +511,34 @@ router.put('/api/buyers/:id', async (req, res) => {
         message: 'Product, HSN Code, Country, and Company Name are required'
       });
     }
+
+    // Normalize contacts/emails for duplicate comparison
+    const normalizedContacts = (contacts || [])
+      .filter((c) => c.contact_number && c.contact_number.trim())
+      .map((c) => c.contact_number.trim());
+
+    const normalizedEmails = (emails || [])
+      .filter((e) => e.email && e.email.trim())
+      .map((e) => e.email.trim());
+
+    // ---- Duplicate check (excludes this buyer's own id) ----
+    const duplicateCheck = await checkDuplicateBuyer(
+      connection,
+      product,
+      company_name,
+      normalizedContacts,
+      normalizedEmails,
+      id
+    );
+
+    if (duplicateCheck) {
+      return res.status(409).json({
+        success: false,
+        duplicate: true,
+        message: duplicateCheck.message
+      });
+    }
+    // ---- End duplicate check ----
 
     // Start transaction
     await connection.beginTransaction();
@@ -445,7 +591,7 @@ router.put('/api/buyers/:id', async (req, res) => {
         INSERT INTO buyer_contacts (buyer_id, contact_number) 
         VALUES (?, ?)
       `;
-      
+
       for (const contact of contacts) {
         if (contact.contact_number && contact.contact_number.trim()) {
           await connection.execute(contactQuery, [
@@ -462,7 +608,7 @@ router.put('/api/buyers/:id', async (req, res) => {
         INSERT INTO buyer_emails (buyer_id, email) 
         VALUES (?, ?)
       `;
-      
+
       for (const email of emails) {
         if (email.email && email.email.trim()) {
           await connection.execute(emailQuery, [
@@ -524,7 +670,7 @@ router.put('/api/buyers/:id', async (req, res) => {
   } catch (error) {
     // Rollback transaction on error
     await connection.rollback();
-    
+
     console.error('Error updating buyer:', error);
     res.status(500).json({
       success: false,
@@ -542,7 +688,7 @@ router.put('/api/buyers/:id', async (req, res) => {
  */
 router.delete('/api/buyers/:id', async (req, res) => {
   const connection = await pool.getConnection();
-  
+
   try {
     const { id } = req.params;
 
@@ -551,10 +697,10 @@ router.delete('/api/buyers/:id', async (req, res) => {
 
     // Delete contacts
     await connection.execute('DELETE FROM buyer_contacts WHERE buyer_id = ?', [id]);
-    
+
     // Delete emails
     await connection.execute('DELETE FROM buyer_emails WHERE buyer_id = ?', [id]);
-    
+
     // Delete buyer
     const [result] = await connection.execute('DELETE FROM buyers WHERE id = ?', [id]);
 
@@ -577,7 +723,7 @@ router.delete('/api/buyers/:id', async (req, res) => {
   } catch (error) {
     // Rollback transaction on error
     await connection.rollback();
-    
+
     console.error('Error deleting buyer:', error);
     res.status(500).json({
       success: false,
@@ -596,7 +742,7 @@ router.delete('/api/buyers/:id', async (req, res) => {
 router.get('/api/buyers/stats', async (req, res) => {
   try {
     const [totalBuyers] = await pool.query('SELECT COUNT(*) as total FROM buyers');
-    
+
     const [countryStats] = await pool.query(`
       SELECT country, COUNT(*) as count 
       FROM buyers 
@@ -605,7 +751,7 @@ router.get('/api/buyers/stats', async (req, res) => {
       ORDER BY count DESC
       LIMIT 10
     `);
-    
+
     const [productStats] = await pool.query(`
       SELECT product, COUNT(*) as count 
       FROM buyers 

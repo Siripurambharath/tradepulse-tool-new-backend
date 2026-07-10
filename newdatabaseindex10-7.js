@@ -9,7 +9,8 @@ const { ExpressAdapter } = require('@bull-board/express');
 // const { checkForReplies } = require('./readReplies');
 const jwt = require("jsonwebtoken");
 require('dotenv').config();
-
+const buyerRoutes = require('./routes/buyerRoutes');
+const bulkBuyerRoutes = require('./routes/bulkBuyerRoutes'); 
 const app = express();
 
 app.use(cors());
@@ -27,7 +28,7 @@ const pool = mysql.createPool({
   waitForConnections: true,
   connectionLimit: 20,
 });
-
+app.set('pool', pool);
 /* ─────────────────────────────────────────────
    FETCH EMAIL PROFILE BY SELLER ID
 ───────────────────────────────────────────── */
@@ -548,7 +549,6 @@ app.get('/history', async (req, res) => {
       ORDER BY MAX(sent_at) DESC
     `, [seller_id]);
 
-    // For each batch, get its companies data
     const historyData = await Promise.all(
       batches.map(async (batch) => {
         const [results] = await pool.query(
@@ -576,7 +576,7 @@ app.get('/history', async (req, res) => {
 
         if (!results.length) return null;
 
-        // Fix counts logic
+        // Calculate counts
         const counts = {
           total: results.length,
           replied: results.filter(row => row.message && row.message.trim() !== '').length,
@@ -585,27 +585,34 @@ app.get('/history', async (req, res) => {
           emailSent: results.filter(row => row.status === 'sent' || row.response === null).length
         };
 
-        // FILTER: Remove entries that have ANY non-interested responses along with interested responses
-        // This means: if there's at least one interested AND (any not_interested OR any null response OR any email sent)
-        const hasNonInterested = results.some(row => 
-          row.response === 'not_interested' || 
-          row.response === null || 
-          row.status === 'sent'
-        );
-        
-        if (counts.interested > 0 && hasNonInterested) {
-          return null; // Remove this batch
-        }
-
+        // ✅ FIX: Build companies array with combined statuses
         const companies = results.map((row) => {
           let displayStatus = 'Email Sent';
-          
-          if (row.response === 'interested') {
-            displayStatus = 'Interested';
-          } else if (row.response === 'not_interested') {
-            displayStatus = 'Not Interested';
-          } else if (row.message && row.message.trim() !== '') {
+
+          const hasMessage = row.message && row.message.trim() !== '';
+          const isInterested = row.response === 'interested';
+          const isNotInterested = row.response === 'not_interested';
+
+          // ✅ Handle ALL combinations
+          if (hasMessage && isInterested) {
+            displayStatus = 'Replied, Interested';
+          } else if (hasMessage && isNotInterested) {
+            displayStatus = 'Replied, Not Interested';
+          } else if (hasMessage) {
             displayStatus = 'Replied';
+          } else if (isInterested) {
+            displayStatus = 'Interested';
+          } else if (isNotInterested) {
+            displayStatus = 'Not Interested';
+          }
+
+          // Clean the message - take only the first line
+          let cleanedMessage = null;
+          let cleanedSubject = row.subject;
+          
+          if (row.message && row.message.trim() !== '') {
+            const firstLine = row.message.split('\n')[0];
+            cleanedMessage = firstLine.trim();
           }
 
           return {
@@ -617,13 +624,16 @@ app.get('/history', async (req, res) => {
             respondedAt: row.reply_date || row.responded_at,
             status: displayStatus,
             templateUsed: row.template_used,
-            subject: row.subject,
-            message: row.message,
-            product: row.product
+            subject: cleanedSubject,
+            message: cleanedMessage,
+            product: row.product,
+            // Add individual flags for frontend
+            hasReply: hasMessage,
+            isInterested: isInterested,
+            isNotInterested: isNotInterested
           };
         });
 
-        // Determine main product display
         let mainProduct = results[0]?.product || batch.product_name;
         if (batch.multiple_products === 1) {
           mainProduct = "General Products";
@@ -635,12 +645,19 @@ app.get('/history', async (req, res) => {
           multiple_products: batch.multiple_products,
           date: batch.sent_at,
           companies,
-          counts
+          counts,
+          summary: {
+            hasInterested: counts.interested > 0,
+            hasReplied: counts.replied > 0,
+            hasNotInterested: counts.notInterested > 0,
+            allSent: counts.emailSent === counts.total,
+            allReplied: counts.replied === counts.total
+          }
         };
       })
     );
 
-    // Filter out any null results
+    // Filter out null results
     const filteredData = historyData.filter(item => item !== null);
     
     // Remove duplicates by batch_id
@@ -652,14 +669,28 @@ app.get('/history', async (req, res) => {
       return acc;
     }, []);
 
-    res.json(uniqueData);
+    // Sort by date (newest first) and then by priority (interested first)
+    uniqueData.sort((a, b) => {
+      const dateCompare = new Date(b.date) - new Date(a.date);
+      if (dateCompare !== 0) return dateCompare;
+      
+      if (a.counts.interested > 0 && b.counts.interested === 0) return -1;
+      if (a.counts.interested === 0 && b.counts.interested > 0) return 1;
+      
+      return 0;
+    });
+
+    res.json({
+      success: true,
+      total: uniqueData.length,
+      data: uniqueData
+    });
 
   } catch (err) {
     console.error('GET /history error:', err);
     res.status(500).json({ error: err.message });
   }
 });
-
 // Add this helper function at the top of your server.js
 function generateUUID() {
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
@@ -757,7 +788,6 @@ app.post('/api/store-response', async (req, res) => {
 });
 
 
-
 app.get('/history/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -786,6 +816,8 @@ app.get('/history/:id', async (req, res) => {
       [id]
     );
 
+    console.log(`Found ${results.length} records for batch ${id}`);
+
     if (!results.length) {
       return res.status(404).json({
         success: false,
@@ -793,6 +825,7 @@ app.get('/history/:id', async (req, res) => {
       });
     }
 
+    // Calculate counts
     const counts = {
       total: results.length,
       replied: 0,
@@ -801,42 +834,47 @@ app.get('/history/:id', async (req, res) => {
       emailSent: 0
     };
 
-    // If any row in the batch contains a message
-    counts.replied = results.some(
-      row => row.message && row.message.trim() !== ''
-    ) ? 1 : 0;
-
     results.forEach((row) => {
+      if (row.message && row.message.trim() !== '') {
+        counts.replied++;
+      }
       if (row.response === 'interested') {
         counts.interested++;
       }
-
       if (row.response === 'not_interested') {
         counts.notInterested++;
       }
-
-      if (row.status === 'sent') {
+      if (row.status === 'sent' || row.response === null) {
         counts.emailSent++;
       }
     });
 
+    // Build companies array
     const companies = results.map((row) => {
       let displayStatus = 'Email Sent';
 
-      if (row.message && row.message.trim() !== '') {
+      const hasMessage = row.message && row.message.trim() !== '';
+      const isInterested = row.response === 'interested';
+      const isNotInterested = row.response === 'not_interested';
+
+      // ✅ Handle ALL combinations
+      if (hasMessage && isInterested) {
+        displayStatus = 'Replied, Interested';
+      } else if (hasMessage && isNotInterested) {
+        displayStatus = 'Replied, Not Interested';
+      } else if (hasMessage) {
         displayStatus = 'Replied';
-      } else if (row.response === 'interested') {
+      } else if (isInterested) {
         displayStatus = 'Interested';
-      } else if (row.response === 'not_interested') {
+      } else if (isNotInterested) {
         displayStatus = 'Not Interested';
       }
 
-      // Clean the message - take only the first line before any newline
-      let cleanedMessage = row.message;
+      // Clean the message - take only the first line
+      let cleanedMessage = null;
       let cleanedSubject = row.subject;
       
       if (row.message && row.message.trim() !== '') {
-        // Get the first line only (before first newline)
         const firstLine = row.message.split('\n')[0];
         cleanedMessage = firstLine.trim();
       }
@@ -851,12 +889,16 @@ app.get('/history/:id', async (req, res) => {
         status: displayStatus,
         templateUsed: row.template_used,
         subject: cleanedSubject,
-        message: cleanedMessage,  // Will be "bharath new" only
-        product: row.product
+        message: cleanedMessage,
+        product: row.product,
+        // Add individual flags for frontend
+        hasReply: hasMessage,
+        isInterested: isInterested,
+        isNotInterested: isNotInterested
       };
     });
 
-    // Get multiple_products value from first row (same for all in batch)
+    // Get multiple_products value from first row
     const multipleProducts = results[0].multiple_products;
 
     // Determine main product display
@@ -882,6 +924,13 @@ app.get('/history/:id', async (req, res) => {
     });
   }
 });
+
+
+// Add this endpoint after the /api/seller/login endpoint
+
+// ============================================
+// API: Store User in Local Database
+// ============================================
 
 
 app.get('/history/:id/replies', async (req, res) => {
@@ -1165,82 +1214,82 @@ app.get('/api/replyhistory/:buyerId', async (req, res) => {
 });
 
 
-app.get('/api/replyhistory/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
+// app.get('/api/replyhistory/:id', async (req, res) => {
+//   try {
+//     const { id } = req.params;
 
-    const query = `
-      SELECT 
-        id,
-        batch_id,
-        from_email,
-        to_email,
-        subject,
-        message,
-        product_name,
-        reply_date,
-        company_name,
-        contact_name,
-        country,
-        status,
-        template_used,
-        response,
-        responded_at,
-        sent_at
-      FROM email_history_companies
-      WHERE id = ?
-      LIMIT 1
-    `;
+//     const query = `
+//       SELECT 
+//         id,
+//         batch_id,
+//         from_email,
+//         to_email,
+//         subject,
+//         message,
+//         product_name,
+//         reply_date,
+//         company_name,
+//         contact_name,
+//         country,
+//         status,
+//         template_used,
+//         response,
+//         responded_at,
+//         sent_at
+//       FROM email_history_companies
+//       WHERE id = ?
+//       LIMIT 1
+//     `;
 
-    const [results] = await pool.query(query, [id]);
+//     const [results] = await pool.query(query, [id]);
 
-    if (results.length === 0) {
-      return res.status(404).json({ success: false, message: "Email reply not found" });
-    }
+//     if (results.length === 0) {
+//       return res.status(404).json({ success: false, message: "Email reply not found" });
+//     }
 
-    const reply = results[0];
+//     const reply = results[0];
 
-    let cleanedSubject = reply.subject || '';
-    cleanedSubject = cleanedSubject.replace(/\s*\[BATCH:[^\]]+\]/g, '');
-    cleanedSubject = cleanedSubject.replace(/^Re:\s*/, '');
+//     let cleanedSubject = reply.subject || '';
+//     cleanedSubject = cleanedSubject.replace(/\s*\[BATCH:[^\]]+\]/g, '');
+//     cleanedSubject = cleanedSubject.replace(/^Re:\s*/, '');
 
-    let cleanedMessage = reply.message;
-    const onIndex = cleanedMessage.indexOf('\nOn');
-    if (onIndex !== -1) {
-      cleanedMessage = cleanedMessage.substring(0, onIndex).trim();
-    }
+//     let cleanedMessage = reply.message;
+//     const onIndex = cleanedMessage.indexOf('\nOn');
+//     if (onIndex !== -1) {
+//       cleanedMessage = cleanedMessage.substring(0, onIndex).trim();
+//     }
 
-    cleanedMessage = cleanedMessage
-      .replace(/\\u003C/g, '<')
-      .replace(/\\u003E/g, '>')
-      .trim();
+//     cleanedMessage = cleanedMessage
+//       .replace(/\\u003C/g, '<')
+//       .replace(/\\u003E/g, '>')
+//       .trim();
 
-    res.json({
-      success: true,
-      data: {
-        id: reply.id,
-        batch_id: reply.batch_id,
-        from_email: reply.from_email,
-        to_email: reply.to_email,
-        subject: cleanedSubject,
-        message: cleanedMessage,
-        product_name: reply.product_name,
-        reply_date: reply.reply_date,
-        company_name: reply.company_name,
-        contact_name: reply.contact_name,
-        country: reply.country,
-        status: reply.status,
-        template_used: reply.template_used,
-        response: reply.response,
-        responded_at: reply.responded_at
-      }
-    });
+//     res.json({
+//       success: true,
+//       data: {
+//         id: reply.id,
+//         batch_id: reply.batch_id,
+//         from_email: reply.from_email,
+//         to_email: reply.to_email,
+//         subject: cleanedSubject,
+//         message: cleanedMessage,
+//         product_name: reply.product_name,
+//         reply_date: reply.reply_date,
+//         company_name: reply.company_name,
+//         contact_name: reply.contact_name,
+//         country: reply.country,
+//         status: reply.status,
+//         template_used: reply.template_used,
+//         response: reply.response,
+//         responded_at: reply.responded_at
+//       }
+//     });
 
-  } catch (error) {
-    console.error("Error fetching email reply:", error);
-    res.status(500).json({ success: false, message: "Error fetching email reply", error: error.message });
-  }
-});
+//   } catch (error) {
+//     console.error("Error fetching email reply:", error);
+//     res.status(500).json({ success: false, message: "Error fetching email reply", error: error.message });
+//   }
+// });
 
 
 app.get('/api/tracking/counts', async (req, res) => {
@@ -1887,6 +1936,59 @@ app.post("/api/seller/login", async (req, res) => {
     });
   }
 });
+app.post("/api/store-user", async (req, res) => {
+  try {
+    const { id, email, password, role } = req.body;
+
+    if (!id || !email || !password) {
+      return res.status(400).json({
+        success: false,
+        message: "id, email and password are required",
+      });
+    }
+
+    // Check existing user
+    const [existing] = await pool.execute(
+      "SELECT user_id FROM users WHERE email = ?",
+      [email]
+    );
+
+    if (existing.length > 0) {
+      return res.status(200).json({
+        success: true,
+        exists: true,
+        message: "User already exists",
+      });
+    }
+
+    const [result] = await pool.execute(
+      `INSERT INTO users
+      (id, email, password, role, email_sent, email_config)
+      VALUES (?, ?, ?, ?, 0, 0)`,
+      [
+        id,
+        email,
+        password,
+        role || "seller"
+      ]
+    );
+
+    res.json({
+      success: true,
+      message: "User stored successfully",
+      user_id: result.insertId,
+      id,
+    });
+
+  } catch (err) {
+    console.error(err);
+
+    res.status(500).json({
+      success: false,
+      message: err.message,
+    });
+  }
+});
 
 app.get("/api/email-configurations/:sellerId", async (req, res) => {
   try {
@@ -2160,6 +2262,7 @@ app.post("/api/send-test-email/:sellerId", async (req, res) => {
 
 });
 
+
 // routes/email.js
 
 app.get("/status/:userId", async (req, res) => {
@@ -2191,89 +2294,8 @@ app.get("/status/:userId", async (req, res) => {
   }
 });
 
-app.post("/store-login", (req, res) => {
-  const { id, email, password, role } = req.body;
-
-  console.log("Received store-login request:", req.body);
-
-  if (!id || !email || !password || !role) {
-    return res.status(400).json({
-      success: false,
-      message: "Required fields are missing.",
-    });
-  }
-
-  pool.query(
-    "SELECT * FROM users WHERE id = ?",
-    [id],
-    (err, results) => {
-      if (err) {
-        console.log("SELECT ERROR:", err);
-        return res.status(500).json({
-          success: false,
-          message: err.message,
-        });
-      }
-
-      console.log("SELECT RESULTS:", results);
-
-      // Update existing user
-      if (results.length > 0) {
-        pool.query(
-          `UPDATE users
-           SET email=?,
-               password=?,
-               role=?,
-               email_sent=0,
-               email_config=1
-           WHERE id=?`,
-          [email, password, role, id],
-          (err, result) => {
-            if (err) {
-              console.log("UPDATE ERROR:", err);
-              return res.status(500).json({
-                success: false,
-                message: err.message,
-              });
-            }
-
-            console.log("UPDATE RESULT:", result);
-
-            return res.json({
-              success: true,
-              message: "User updated successfully.",
-            });
-          }
-        );
-      } else {
-        // Insert new user
-        pool.query(
-          `INSERT INTO users
-          (id, email, password, role, email_sent, email_config)
-          VALUES (?, ?, ?, ?, ?, ?)`,
-          [String(id), email, password, role, 0, 1],
-          (err, result) => {
-            if (err) {
-              console.log("INSERT ERROR:", err);
-              return res.status(500).json({
-                success: false,
-                message: err.message,
-              });
-            }
-
-            console.log("INSERT RESULT:", result);
-
-            return res.json({
-              success: true,
-              message: "User stored successfully.",
-            });
-          }
-        );
-      }
-    }
-  );
-});
-
+app.use('/', buyerRoutes);
+app.use('/', bulkBuyerRoutes);
 /* ─────────────────────────────────────────────
    START SERVER
 ───────────────────────────────────────────── */
