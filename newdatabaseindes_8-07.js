@@ -23,7 +23,7 @@ const pool = mysql.createPool({
   host: "localhost",
   user: "root",
   password: "",
-  database: "seller_buyer_dummy_old",
+  database: "seller_buyer_dummy",
   waitForConnections: true,
   connectionLimit: 20,
 });
@@ -1165,82 +1165,82 @@ app.get('/api/replyhistory/:buyerId', async (req, res) => {
 });
 
 
-// app.get('/api/replyhistory/:id', async (req, res) => {
-//   try {
-//     const { id } = req.params;
+app.get('/api/replyhistory/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
 
-//     const query = `
-//       SELECT 
-//         id,
-//         batch_id,
-//         from_email,
-//         to_email,
-//         subject,
-//         message,
-//         product_name,
-//         reply_date,
-//         company_name,
-//         contact_name,
-//         country,
-//         status,
-//         template_used,
-//         response,
-//         responded_at,
-//         sent_at
-//       FROM email_history_companies
-//       WHERE id = ?
-//       LIMIT 1
-//     `;
+    const query = `
+      SELECT 
+        id,
+        batch_id,
+        from_email,
+        to_email,
+        subject,
+        message,
+        product_name,
+        reply_date,
+        company_name,
+        contact_name,
+        country,
+        status,
+        template_used,
+        response,
+        responded_at,
+        sent_at
+      FROM email_history_companies
+      WHERE id = ?
+      LIMIT 1
+    `;
 
-//     const [results] = await pool.query(query, [id]);
+    const [results] = await pool.query(query, [id]);
 
-//     if (results.length === 0) {
-//       return res.status(404).json({ success: false, message: "Email reply not found" });
-//     }
+    if (results.length === 0) {
+      return res.status(404).json({ success: false, message: "Email reply not found" });
+    }
 
-//     const reply = results[0];
+    const reply = results[0];
 
-//     let cleanedSubject = reply.subject || '';
-//     cleanedSubject = cleanedSubject.replace(/\s*\[BATCH:[^\]]+\]/g, '');
-//     cleanedSubject = cleanedSubject.replace(/^Re:\s*/, '');
+    let cleanedSubject = reply.subject || '';
+    cleanedSubject = cleanedSubject.replace(/\s*\[BATCH:[^\]]+\]/g, '');
+    cleanedSubject = cleanedSubject.replace(/^Re:\s*/, '');
 
-//     let cleanedMessage = reply.message;
-//     const onIndex = cleanedMessage.indexOf('\nOn');
-//     if (onIndex !== -1) {
-//       cleanedMessage = cleanedMessage.substring(0, onIndex).trim();
-//     }
+    let cleanedMessage = reply.message;
+    const onIndex = cleanedMessage.indexOf('\nOn');
+    if (onIndex !== -1) {
+      cleanedMessage = cleanedMessage.substring(0, onIndex).trim();
+    }
 
-//     cleanedMessage = cleanedMessage
-//       .replace(/\\u003C/g, '<')
-//       .replace(/\\u003E/g, '>')
-//       .trim();
+    cleanedMessage = cleanedMessage
+      .replace(/\\u003C/g, '<')
+      .replace(/\\u003E/g, '>')
+      .trim();
 
-//     res.json({
-//       success: true,
-//       data: {
-//         id: reply.id,
-//         batch_id: reply.batch_id,
-//         from_email: reply.from_email,
-//         to_email: reply.to_email,
-//         subject: cleanedSubject,
-//         message: cleanedMessage,
-//         product_name: reply.product_name,
-//         reply_date: reply.reply_date,
-//         company_name: reply.company_name,
-//         contact_name: reply.contact_name,
-//         country: reply.country,
-//         status: reply.status,
-//         template_used: reply.template_used,
-//         response: reply.response,
-//         responded_at: reply.responded_at
-//       }
-//     });
+    res.json({
+      success: true,
+      data: {
+        id: reply.id,
+        batch_id: reply.batch_id,
+        from_email: reply.from_email,
+        to_email: reply.to_email,
+        subject: cleanedSubject,
+        message: cleanedMessage,
+        product_name: reply.product_name,
+        reply_date: reply.reply_date,
+        company_name: reply.company_name,
+        contact_name: reply.contact_name,
+        country: reply.country,
+        status: reply.status,
+        template_used: reply.template_used,
+        response: reply.response,
+        responded_at: reply.responded_at
+      }
+    });
 
-//   } catch (error) {
-//     console.error("Error fetching email reply:", error);
-//     res.status(500).json({ success: false, message: "Error fetching email reply", error: error.message });
-//   }
-// });
+  } catch (error) {
+    console.error("Error fetching email reply:", error);
+    res.status(500).json({ success: false, message: "Error fetching email reply", error: error.message });
+  }
+});
 
 
 app.get('/api/tracking/counts', async (req, res) => {
