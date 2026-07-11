@@ -11,6 +11,7 @@ const jwt = require("jsonwebtoken");
 require('dotenv').config();
 const buyerRoutes = require('./routes/buyerRoutes');
 const bulkBuyerRoutes = require('./routes/bulkBuyerRoutes'); 
+const userRoutes = require('./routes/UsersRoutes');
 const app = express();
 
 app.use(cors());
@@ -2660,6 +2661,7 @@ app.get("/status/:userId", async (req, res) => {
 
 app.use('/', buyerRoutes);
 app.use('/', bulkBuyerRoutes);
+app.use('/', userRoutes);
 /* ─────────────────────────────────────────────
    START SERVER
 ───────────────────────────────────────────── */
