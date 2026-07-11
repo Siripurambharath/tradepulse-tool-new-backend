@@ -926,6 +926,354 @@ app.get('/history/:id', async (req, res) => {
 });
 
 
+app.get('/api/admin/history', async (req, res) => {
+  console.log('GET /api/admin/history called');
+  
+  try {
+    // Get all records - NO seller_id filter
+    const [results] = await pool.query(`
+      SELECT 
+        id,
+        seller_id,
+        company_name,
+        country,
+        contact_name,
+        email,
+        from_email,
+        to_email,
+        subject,
+        message,
+        product_name,
+        reply_date,
+        sent_at,
+        status,
+        template_used,
+        response,
+        responded_at,
+        batch_id,
+        buyer_id,
+        multiple_products,
+        template_id,
+        DATE_FORMAT(sent_at, '%Y-%m-%d %H:%i:%s') as sent_at_formatted,
+        DATE_FORMAT(reply_date, '%Y-%m-%d %H:%i:%s') as reply_date_formatted,
+        DATE_FORMAT(responded_at, '%Y-%m-%d %H:%i:%s') as responded_at_formatted,
+        CASE 
+          WHEN message IS NOT NULL AND message != '' AND response = 'interested' THEN 'Replied, Interested'
+          WHEN message IS NOT NULL AND message != '' AND response = 'not_interested' THEN 'Replied, Not Interested'
+          WHEN message IS NOT NULL AND message != '' THEN 'Replied'
+          WHEN response = 'interested' THEN 'Interested'
+          WHEN response = 'not_interested' THEN 'Not Interested'
+          WHEN status = 'sent' THEN 'Sent'
+          ELSE 'Unknown'
+        END as display_status,
+        CASE 
+          WHEN message IS NOT NULL AND message != '' THEN 1 
+          ELSE 0 
+        END as has_reply,
+        CASE 
+          WHEN response = 'interested' THEN 1 
+          ELSE 0 
+        END as is_interested,
+        CASE 
+          WHEN response = 'not_interested' THEN 1 
+          ELSE 0 
+        END as is_not_interested
+      FROM email_history_companies
+      ORDER BY sent_at DESC, id DESC
+    `);
+    
+    console.log(`Found ${results.length} total records for admin`);
+    
+    if (results.length === 0) {
+      return res.json({
+        success: true,
+        message: 'No history records found',
+        data: [],
+        total: 0,
+        summary: {
+          total_records: 0,
+          total_sellers: 0,
+          total_batches: 0,
+          total_buyers: 0,
+          total_sent: 0,
+          total_replied: 0,
+          total_interested: 0,
+          total_not_interested: 0
+        }
+      });
+    }
+
+    // Get summary statistics
+    const [stats] = await pool.query(`
+      SELECT 
+        COUNT(*) as total_records,
+        COUNT(DISTINCT seller_id) as total_sellers,
+        COUNT(DISTINCT batch_id) as total_batches,
+        COUNT(DISTINCT buyer_id) as total_buyers,
+        SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END) as total_sent,
+        SUM(CASE WHEN message IS NOT NULL AND message != '' THEN 1 ELSE 0 END) as total_replied,
+        SUM(CASE WHEN response = 'interested' THEN 1 ELSE 0 END) as total_interested,
+        SUM(CASE WHEN response = 'not_interested' THEN 1 ELSE 0 END) as total_not_interested
+      FROM email_history_companies
+    `);
+
+    // Get seller breakdown
+    const [sellerBreakdown] = await pool.query(`
+      SELECT 
+        seller_id,
+        COUNT(*) as total_records,
+        COUNT(DISTINCT batch_id) as total_batches,
+        COUNT(DISTINCT buyer_id) as total_buyers,
+        SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END) as sent_count,
+        SUM(CASE WHEN message IS NOT NULL AND message != '' THEN 1 ELSE 0 END) as replied_count,
+        SUM(CASE WHEN response = 'interested' THEN 1 ELSE 0 END) as interested_count,
+        SUM(CASE WHEN response = 'not_interested' THEN 1 ELSE 0 END) as not_interested_count
+      FROM email_history_companies
+      GROUP BY seller_id
+      ORDER BY total_records DESC
+    `);
+
+    // Get batch breakdown
+    const [batchBreakdown] = await pool.query(`
+      SELECT 
+        batch_id,
+        seller_id,
+        COUNT(*) as total_records,
+        MAX(product_name) as product_name,
+        MIN(sent_at) as first_sent,
+        MAX(sent_at) as last_sent,
+        SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END) as sent_count,
+        SUM(CASE WHEN message IS NOT NULL AND message != '' THEN 1 ELSE 0 END) as replied_count,
+        SUM(CASE WHEN response = 'interested' THEN 1 ELSE 0 END) as interested_count,
+        SUM(CASE WHEN response = 'not_interested' THEN 1 ELSE 0 END) as not_interested_count
+      FROM email_history_companies
+      GROUP BY batch_id, seller_id
+      ORDER BY last_sent DESC
+    `);
+
+    res.json({
+      success: true,
+      total: results.length,
+      data: results,
+      summary: {
+        total_records: stats[0]?.total_records || 0,
+        total_sellers: stats[0]?.total_sellers || 0,
+        total_batches: stats[0]?.total_batches || 0,
+        total_buyers: stats[0]?.total_buyers || 0,
+        total_sent: stats[0]?.total_sent || 0,
+        total_replied: stats[0]?.total_replied || 0,
+        total_interested: stats[0]?.total_interested || 0,
+        total_not_interested: stats[0]?.total_not_interested || 0
+      },
+      seller_breakdown: sellerBreakdown,
+      batch_breakdown: batchBreakdown
+    });
+
+  } catch (err) {
+    console.error('GET /api/admin/history error:', err);
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
+  }
+});
+
+app.get('/api/admin/history/:id', async (req, res) => {
+  const { id } = req.params;
+  
+  console.log('GET /api/admin/history/:id called with id:', id);
+  
+  try {
+    // First try to find records with this buyer_id
+    let [results] = await pool.query(`
+      SELECT 
+        id,
+        buyer_id,
+        batch_id,
+        seller_id,
+        company_name,
+        country,
+        contact_name,
+        from_email,
+        to_email,
+        subject,
+        message,
+        product_name,
+        sent_at,
+        reply_date,
+        responded_at,
+        status,
+        template_used,
+        response,
+        DATE_FORMAT(sent_at, '%Y-%m-%d %H:%i:%s') as sent_at_formatted,
+        DATE_FORMAT(reply_date, '%Y-%m-%d %H:%i:%s') as reply_date_formatted,
+        DATE_FORMAT(responded_at, '%Y-%m-%d %H:%i:%s') as responded_at_formatted,
+        CASE 
+          WHEN message IS NOT NULL AND message != '' AND response = 'interested' THEN 'Replied, Interested'
+          WHEN message IS NOT NULL AND message != '' AND response = 'not_interested' THEN 'Replied, Not Interested'
+          WHEN message IS NOT NULL AND message != '' THEN 'Replied'
+          WHEN response = 'interested' THEN 'Interested'
+          WHEN response = 'not_interested' THEN 'Not Interested'
+          WHEN status = 'sent' THEN 'Sent'
+          ELSE 'Unknown'
+        END as display_status
+      FROM email_history_companies
+      WHERE buyer_id = ?
+      ORDER BY sent_at DESC, id DESC
+    `, [id]);
+    
+    if (results.length === 0) {
+      [results] = await pool.query(`
+        SELECT 
+          id,
+          buyer_id,
+          batch_id,
+          seller_id,
+          company_name,
+          country,
+          contact_name,
+          from_email,
+          to_email,
+          subject,
+          message,
+          product_name,
+          sent_at,
+          reply_date,
+          responded_at,
+          status,
+          template_used,
+          response,
+          DATE_FORMAT(sent_at, '%Y-%m-%d %H:%i:%s') as sent_at_formatted,
+          DATE_FORMAT(reply_date, '%Y-%m-%d %H:%i:%s') as reply_date_formatted,
+          DATE_FORMAT(responded_at, '%Y-%m-%d %H:%i:%s') as responded_at_formatted,
+          CASE 
+            WHEN message IS NOT NULL AND message != '' AND response = 'interested' THEN 'Replied, Interested'
+            WHEN message IS NOT NULL AND message != '' AND response = 'not_interested' THEN 'Replied, Not Interested'
+            WHEN message IS NOT NULL AND message != '' THEN 'Replied'
+            WHEN response = 'interested' THEN 'Interested'
+            WHEN response = 'not_interested' THEN 'Not Interested'
+            WHEN status = 'sent' THEN 'Sent'
+            ELSE 'Unknown'
+          END as display_status
+        FROM email_history_companies
+        WHERE id = ?
+        ORDER BY sent_at DESC, id DESC
+      `, [id]);
+    }
+    
+    if (results.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'No records found for this buyer'
+      });
+    }
+
+    // Clean the message for each result
+    const cleanedResults = results.map(row => {
+      let cleanedMessage = row.message;
+      
+      if (cleanedMessage) {
+        // Remove quoted/replied content (everything after "wrote:" or "On ... wrote:")
+        const patterns = [
+          /\nOn\s+.+\s+wrote:\s*\n/i,
+          /\n-----Original Message-----\s*\n/i,
+          /\n>+\s*.+\n/i,
+          /\n\n\n.*\nOn\s+/s,
+          /\n\n.*wrote:\s*\n/s
+        ];
+        
+        let replyEndIndex = -1;
+        for (const pattern of patterns) {
+          const match = cleanedMessage.match(pattern);
+          if (match) {
+            replyEndIndex = match.index;
+            break;
+          }
+        }
+        
+        if (replyEndIndex !== -1) {
+          cleanedMessage = cleanedMessage.substring(0, replyEndIndex).trim();
+        } else {
+          // If no pattern found, take only the first paragraph
+          const parts = cleanedMessage.split(/\n\s*\n\s*\n/);
+          if (parts.length > 0) {
+            cleanedMessage = parts[0].trim();
+          }
+        }
+        
+        // Remove any remaining quoted lines (starting with >)
+        cleanedMessage = cleanedMessage.split('\n')
+          .filter(line => !line.trim().startsWith('>'))
+          .join('\n')
+          .trim();
+        
+        // Remove special characters and URLs
+        cleanedMessage = cleanedMessage
+          .replace(/\\u003C/g, '<')
+          .replace(/\\u003E/g, '>')
+          .replace(/\[[^\]]*\]/g, '')
+          .replace(/https?:\/\/[^\s]+/g, '')
+          .trim();
+      }
+      
+      // Clean subject as well
+      let cleanedSubject = row.subject;
+      if (cleanedSubject) {
+        cleanedSubject = cleanedSubject.replace(/\s*\[BATCH:[^\]]+\]/g, '');
+        cleanedSubject = cleanedSubject.replace(/^Re:\s*/i, '');
+        cleanedSubject = cleanedSubject.trim();
+      }
+      
+      return {
+        ...row,
+        message: cleanedMessage,
+        subject: cleanedSubject
+      };
+    });
+
+    // Get buyer info from first record
+    const firstRecord = results[0];
+    const buyerInfo = {
+      buyer_id: firstRecord.buyer_id,
+      company_name: firstRecord.company_name,
+      country: firstRecord.country,
+      product_name: firstRecord.product_name,
+      contact_name: firstRecord.contact_name,
+      email: firstRecord.from_email || firstRecord.email,
+      all_emails: firstRecord.from_email || '',
+      all_contacts: firstRecord.contact_name || '',
+      seller_id: firstRecord.seller_id
+    };
+
+    // Calculate summary
+    const summary = {
+      total: results.length,
+      sent: results.filter(r => r.status === 'sent' || r.display_status === 'Sent').length,
+      replied: results.filter(r => r.message && r.message.trim() !== '').length,
+      interested: results.filter(r => r.response === 'interested').length,
+      not_interested: results.filter(r => r.response === 'not_interested').length,
+      last_activity: results[0]?.sent_at || null
+    };
+
+    res.json({
+      success: true,
+      data: cleanedResults,
+      buyer_info: buyerInfo,
+      summary: summary
+    });
+
+  } catch (err) {
+    console.error('GET /api/admin/history/:id error:', err);
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
+  }
+});
+
+
+
+
 // Add this endpoint after the /api/seller/login endpoint
 
 // ============================================
@@ -1947,10 +2295,10 @@ app.post("/api/store-user", async (req, res) => {
       });
     }
 
-    // Check existing user
+    // Check existing user based on ID
     const [existing] = await pool.execute(
-      "SELECT user_id FROM users WHERE email = ?",
-      [email]
+      "SELECT user_id, id, email FROM users WHERE id = ?",
+      [id]
     );
 
     if (existing.length > 0) {
@@ -1958,9 +2306,13 @@ app.post("/api/store-user", async (req, res) => {
         success: true,
         exists: true,
         message: "User already exists",
+        user_id: existing[0].user_id,
+        id: existing[0].id,
+        email: existing[0].email
       });
     }
 
+    // User doesn't exist, insert new record
     const [result] = await pool.execute(
       `INSERT INTO users
       (id, email, password, role, email_sent, email_config)
@@ -1973,15 +2325,27 @@ app.post("/api/store-user", async (req, res) => {
       ]
     );
 
-    res.json({
+    res.status(201).json({
       success: true,
+      exists: false,
       message: "User stored successfully",
       user_id: result.insertId,
-      id,
+      id: id,
+      email: email,
+      role: role || "seller"
     });
 
   } catch (err) {
-    console.error(err);
+    console.error('Error in /api/store-user:', err);
+
+    // Handle duplicate entry error
+    if (err.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({
+        success: false,
+        message: "User with this ID already exists",
+        error: err.message
+      });
+    }
 
     res.status(500).json({
       success: false,
