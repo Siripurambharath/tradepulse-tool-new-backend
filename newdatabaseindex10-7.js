@@ -3554,7 +3554,7 @@ app.get("/status/:userId", async (req, res) => {
 app.use('/', buyerRoutes);
 app.use('/', bulkBuyerRoutes);
 app.use('/', userRoutes);
-// app.use('/', ssoRouter);
+app.use('/', ssoRouter);
 /* ─────────────────────────────────────────────
    START SERVER
 ───────────────────────────────────────────── */
