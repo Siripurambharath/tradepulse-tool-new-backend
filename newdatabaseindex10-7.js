@@ -1,7 +1,7 @@
 const express = require("express");
 const mysql = require("mysql2/promise");
 const cors = require("cors");
-// const session = require('express-session');
+ const session = require('express-session');
 
 const nodemailer = require('nodemailer');
 const Bull = require('bull');
@@ -12,7 +12,7 @@ const { checkForReplies } = require('./readReplies');
 const jwt = require("jsonwebtoken");
 require('dotenv').config();
 const buyerRoutes = require('./routes/buyerRoutes');
-// const ssoRouter = require('./routes/ssoRoute');
+const ssoRouter = require('./routes/ssoRoute');
 
 const bulkBuyerRoutes = require('./routes/bulkBuyerRoutes'); 
 const userRoutes = require('./routes/UsersRoutes');
@@ -23,17 +23,17 @@ app.use(express.json());
 
 
 
-// app.use(session({
-//   secret: process.env.SESSION_SECRET || 'replace-with-a-strong-random-secret',
-//   resave: false,
-//   saveUninitialized: false,
-//   cookie: {
-//     secure: true,       // requires HTTPS — needed since you're cross-domain
-//     httpOnly: true,
-//     sameSite: 'none',   // required for cross-domain cookies to be sent/set
-//     maxAge: 24 * 60 * 60 * 1000, // 1 day, adjust as needed
-//   },
-// }));
+app.use(session({
+  secret: process.env.SESSION_SECRET || 'replace-with-a-strong-random-secret',
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    secure: true,       // requires HTTPS — needed since you're cross-domain
+    httpOnly: true,
+    sameSite: 'none',   // required for cross-domain cookies to be sent/set
+    maxAge: 24 * 60 * 60 * 1000, // 1 day, adjust as needed
+  },
+}));
 /* ─────────────────────────────────────────────
    MYSQL
 ───────────────────────────────────────────── */
