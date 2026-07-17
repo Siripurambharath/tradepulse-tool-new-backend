@@ -36,7 +36,7 @@ router.get("/users", async (req, res) => {
         email_sent,
         email_config,
         name,
-        phone,
+        phone_number,
         package_id
       FROM users 
       ORDER BY user_id DESC
@@ -101,7 +101,7 @@ router.get("/users/search", async (req, res) => {
         email_sent,
         email_config,
         name,
-        phone,
+        phone_number,
         package_id
       FROM users 
       ${whereClause}

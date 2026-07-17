@@ -42,7 +42,7 @@ const pool = mysql.createPool({
   host: "localhost",
   user: "root",
   password: "",
-  database: "seller_buyer_dummy",
+  database: "seller_buyer_dummy_old",
   waitForConnections: true,
   connectionLimit: 20,
 });
@@ -3155,15 +3155,16 @@ app.post("/api/seller/login", async (req, res) => {
 });
 app.post("/api/store-user", async (req, res) => {
   try {
-const {
-  id,
-  email,
-  password,
-  role,
-  name,
-  phone,
-  package_id
-} = req.body;
+    const {
+      id,
+      email,
+      password,
+      role,
+      name,
+      phone,
+      package_id,
+      pack_exp_date,
+    } = req.body;
 
     if (!id || !email || !password) {
       return res.status(400).json({
@@ -3172,7 +3173,6 @@ const {
       });
     }
 
-    // Check existing user based on ID
     const [existing] = await pool.execute(
       "SELECT user_id, id, email FROM users WHERE id = ?",
       [id]
@@ -3185,58 +3185,54 @@ const {
         message: "User already exists",
         user_id: existing[0].user_id,
         id: existing[0].id,
-        email: existing[0].email
+        email: existing[0].email,
       });
     }
 
-    // User doesn't exist, insert new record
-   const [result] = await pool.execute(
-  `INSERT INTO users
-  (
-    id,
-    email,
-    password,
-    role,
-    name,
-    phone_number,
-    package_id,
-    email_sent,
-    email_config
-  )
-  VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0)`,
-  [
-    id,
-    email,
-    password,
-    role || "seller",
-    name,
-    phone,
-    package_id
-  ]
-);
+    // 👇 sanitize undefined -> null
+    const safeRole = role ?? "seller";
+    const safeName = name ?? null;
+    const safePhone = phone ?? null;
+    const safePackageId = package_id ?? null;
+    const safePackExpDate = pack_exp_date ?? null;
+
+    const [result] = await pool.execute(
+      `INSERT INTO users
+      (id, email, password, role, name, phone_number, package_id, package_expire, email_sent, email_config)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0)`,
+      [
+        id,
+        email,
+        password,
+        safeRole,
+        safeName,
+        safePhone,
+        safePackageId,
+        safePackExpDate,
+      ]
+    );
 
     res.status(201).json({
-  success: true,
-  exists: false,
-  message: "User stored successfully",
-  user_id: result.insertId,
-  id,
-  email,
-  role,
-  name,
-  phone,
-  package_id
-});
-
+      success: true,
+      exists: false,
+      message: "User stored successfully",
+      user_id: result.insertId,
+      id,
+      email,
+      role: safeRole,
+      name: safeName,
+      phone: safePhone,
+      package_id: safePackageId,
+      pack_exp_date: safePackExpDate,
+    });
   } catch (err) {
-    console.error('Error in /api/store-user:', err);
+    console.error("Error in /api/store-user:", err);
 
-    // Handle duplicate entry error
-    if (err.code === 'ER_DUP_ENTRY') {
+    if (err.code === "ER_DUP_ENTRY") {
       return res.status(409).json({
         success: false,
         message: "User with this ID already exists",
-        error: err.message
+        error: err.message,
       });
     }
 
