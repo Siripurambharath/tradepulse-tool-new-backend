@@ -1,15 +1,19 @@
 const express = require("express");
 const mysql = require("mysql2/promise");
 const cors = require("cors");
+// const session = require('express-session');
+
 const nodemailer = require('nodemailer');
 const Bull = require('bull');
 const { createBullBoard } = require('@bull-board/api');
 const { BullAdapter } = require('@bull-board/api/bullAdapter');
 const { ExpressAdapter } = require('@bull-board/express');
-// const { checkForReplies } = require('./readReplies');
+const { checkForReplies } = require('./readReplies');
 const jwt = require("jsonwebtoken");
 require('dotenv').config();
 const buyerRoutes = require('./routes/buyerRoutes');
+// const ssoRouter = require('./routes/ssoRoute');
+
 const bulkBuyerRoutes = require('./routes/bulkBuyerRoutes'); 
 const userRoutes = require('./routes/UsersRoutes');
 const app = express();
@@ -17,6 +21,19 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+
+
+// app.use(session({
+//   secret: process.env.SESSION_SECRET || 'replace-with-a-strong-random-secret',
+//   resave: false,
+//   saveUninitialized: false,
+//   cookie: {
+//     secure: true,       // requires HTTPS — needed since you're cross-domain
+//     httpOnly: true,
+//     sameSite: 'none',   // required for cross-domain cookies to be sent/set
+//     maxAge: 24 * 60 * 60 * 1000, // 1 day, adjust as needed
+//   },
+// }));
 /* ─────────────────────────────────────────────
    MYSQL
 ───────────────────────────────────────────── */
@@ -29,6 +46,18 @@ const pool = mysql.createPool({
   waitForConnections: true,
   connectionLimit: 20,
 });
+
+
+const remotePool = mysql.createPool({
+  host: "89.116.20.241", 
+  user: "b2buser",
+  password: "5-kFm?qpumuZWTwk9lXa",
+  database: "b2b",
+  waitForConnections: true,
+  connectionLimit: 5,
+});
+
+app.set('remotePool', remotePool);
 app.set('pool', pool);
 /* ─────────────────────────────────────────────
    FETCH EMAIL PROFILE BY SELLER ID
@@ -162,7 +191,6 @@ function buildHtml(message, product, interestedUrl, notInterestedUrl) {
 /* ─────────────────────────────────────────────
    QUEUE PROCESSOR — uses per-job email profile
 ───────────────────────────────────────────── */
-
 emailQueue.process(async (job) => {
   const {
     recipientEmail,
@@ -172,11 +200,12 @@ emailQueue.process(async (job) => {
     originalProduct,
     company,
     batchId,
-    sellerId,        // ✅ pulled from job data
+    sellerId,
     emailProfile,
   } = job.data;
 
   console.log(`Processing job for ${recipientEmail} in batch ${batchId} via profile ${emailProfile?.profile_name} (seller_id=${sellerId})`);
+  console.log(`📞 Contact Number: ${company.contacts || 'Not provided'}`);
 
   await job.progress(20);
 
@@ -227,15 +256,21 @@ emailQueue.process(async (job) => {
       [batchId, recipientEmail]
     );
 
+    // Store contacts in contact_name column
+    const contactValue = company.contacts || company.contact_number || company.contactName || company.companyName || 'Unknown';
+
     if (existing.length > 0) {
       await pool.query(
         `UPDATE email_history_companies 
          SET sent_at = ?, status = ?, template_used = ?, template_id = ?, 
-             product_name = ?, multiple_products = ?, buyer_id = ?, seller_id = ?
+             product_name = ?, multiple_products = ?, buyer_id = ?, seller_id = ?,
+             contact_name = ?
          WHERE batch_id = ? AND email = ?`,
         [new Date(), sendStatus, company.templateUsed || 'Welcome Template',
          company.templateId, originalProduct, job.data.multipleProducts || false,
-         company.buyer_id, sellerId, batchId, recipientEmail]   // ✅ seller_id added
+         company.buyer_id, sellerId, 
+         contactValue,  // Store contacts in contact_name
+         batchId, recipientEmail]
       );
     } else {
       await pool.query(
@@ -243,12 +278,16 @@ emailQueue.process(async (job) => {
           (batch_id, seller_id, buyer_id, company_name, country, contact_name, email, 
            sent_at, status, template_used, template_id, product_name, multiple_products)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [batchId, sellerId, company.buyer_id, company.companyName || 'Unknown',   // ✅ seller_id added
-         company.country || null, company.contactName || company.companyName || 'Unknown',
+        [batchId, sellerId, company.buyer_id, company.companyName || 'Unknown',
+         company.country || null, 
+         contactValue,  // Store contacts in contact_name
          recipientEmail, new Date(), sendStatus, company.templateUsed || 'Welcome Template',
          company.templateId, originalProduct, job.data.multipleProducts || false]
       );
     }
+    
+    console.log(`💾 Stored contact in contact_name: ${contactValue}`);
+
   } catch (dbErr) {
     console.error(`💾 Database error for ${recipientEmail}:`, dbErr.message);
   }
@@ -264,10 +303,6 @@ emailQueue.on('completed', (job, result) => {
 emailQueue.on('failed', (job, err) => {
   console.error(`Job ${job.id} failed — ${job.data.recipientEmail}: ${err.message}`);
 });
-
-/* ─────────────────────────────────────────────
-   /send-email — fetch profile, enqueue jobs
-───────────────────────────────────────────── */
 
 app.post('/send-email', async (req, res) => {
   const { product, subject, message, historyPayload, seller_id } = req.body;
@@ -319,9 +354,11 @@ app.post('/send-email', async (req, res) => {
               ...company,
               buyer_id: company.buyer_id,
               templateId: company.templateId,
+              contacts: company.contacts || company.contact_number || '',  // Pass contacts
+              contactName: company.contactName || company.contacts || company.companyName || 'Unknown',  // Also pass contactName
             },
             batchId,
-            sellerId: seller_id,   // ✅ attached to every job
+            sellerId: seller_id,
             multipleProducts: req.body.multipleProducts || false,
             emailProfile,
           },
@@ -338,6 +375,7 @@ app.post('/send-email', async (req, res) => {
 
     const jobIds = jobs.map((j) => j.id.toString());
     console.log(`Enqueued ${jobIds.length} jobs for batch ${batchId} using seller ${seller_id}`);
+    console.log(`📞 Contacts passed: ${companies.map(c => c.contacts).join(', ')}`);
     res.json({ batchId, jobIds, total: jobIds.length });
 
   } catch (err) {
@@ -405,11 +443,155 @@ app.get('/batch-status/:batchId', async (req, res) => {
    BUYERS / FILTERS / TEMPLATES
 ───────────────────────────────────────────── */
 
+
+app.post("/buyers/:id/reveal-contact", async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const buyerId = Number(req.params.id);
+    const seller_id = String(req.body.seller_id).trim();
+    const { reveal_type } = req.body;
+
+    if (!seller_id || isNaN(buyerId)) {
+      return res.status(400).json({
+        success: false,
+        error: "seller_id and buyer id are required",
+      });
+    }
+    if (!["phone", "email"].includes(reveal_type)) {
+      return res.status(400).json({
+        success: false,
+        error: "reveal_type must be 'phone' or 'email'",
+      });
+    }
+
+    await conn.beginTransaction();
+
+    // Local: get seller's package_id, expiry, and current used counts
+    const [sellerRows] = await conn.query(
+      `SELECT
+          id,
+          package_id,
+          package_expire,
+          phone_used,
+          email_used
+       FROM users
+       WHERE id = ?
+       FOR UPDATE`,
+      [seller_id]
+    );
+
+    if (sellerRows.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ success: false, error: "Seller not found" });
+    }
+
+    const seller = sellerRows[0];
+
+    // Plan expiry check (local)
+    if (!seller.package_expire || new Date(seller.package_expire) < new Date()) {
+      await conn.rollback();
+      return res.status(403).json({
+        success: false,
+        error: "PLAN_EXPIRED",
+        message: "Your subscription plan has expired. Please renew to reveal contacts.",
+      });
+    }
+
+    if (!seller.package_id) {
+      await conn.rollback();
+      return res.status(403).json({
+        success: false,
+        error: "NO_PACKAGE",
+        message: "No active package assigned to this seller.",
+      });
+    }
+
+    // Remote: fetch the buyer_contact_limit tied to this package
+    const [pkgRows] = await remotePool.query(
+      `SELECT buyer_contact_limit FROM tbl_package_membership WHERE id = ?`,
+      [seller.package_id]
+    );
+
+    if (pkgRows.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({
+        success: false,
+        error: "PACKAGE_NOT_FOUND",
+        message: "Package details not found.",
+      });
+    }
+
+    const buyerContactLimit = pkgRows[0].buyer_contact_limit;
+    // NULL (or missing) buyer_contact_limit means Unlimited
+    const isUnlimited = buyerContactLimit === null || buyerContactLimit === undefined;
+
+    // Already revealed?
+    const [existing] = await conn.query(
+      `SELECT 1 FROM contact_reveal_history
+       WHERE seller_id = ? AND buyer_id = ? AND reveal_type = ?`,
+      [seller_id, buyerId, reveal_type]
+    );
+    const alreadyRevealed = existing.length > 0;
+
+    if (!alreadyRevealed) {
+      const usedField = reveal_type === "phone" ? "phone_used" : "email_used";
+      const used = seller[usedField];
+
+      if (!isUnlimited && used >= buyerContactLimit) {
+        await conn.rollback();
+        return res.status(403).json({
+          success: false,
+          error: "LIMIT_REACHED",
+          message: `You've reached your ${reveal_type} reveal limit (${used}/${buyerContactLimit}).`,
+        });
+      }
+
+      await conn.query(
+        `INSERT INTO contact_reveal_history (seller_id, buyer_id, reveal_type, revealed_at)
+         VALUES (?, ?, ?, NOW())`,
+        [seller_id, buyerId, reveal_type]
+      );
+
+      if (!isUnlimited) {
+        await conn.query(
+          `UPDATE users SET ${usedField} = ${usedField} + 1 WHERE id = ?`,
+          [seller_id]
+        );
+      }
+    }
+
+    let data = {};
+    if (reveal_type === "phone") {
+      const [rows] = await conn.query(
+        `SELECT GROUP_CONCAT(DISTINCT contact_number SEPARATOR ', ') AS contacts
+         FROM buyer_contacts WHERE buyer_id = ?`,
+        [buyerId]
+      );
+      data.contacts = rows[0]?.contacts || null;
+    } else {
+      const [rows] = await conn.query(
+        `SELECT GROUP_CONCAT(DISTINCT email SEPARATOR ', ') AS emails
+         FROM buyer_emails WHERE buyer_id = ?`,
+        [buyerId]
+      );
+      data.emails = rows[0]?.emails || null;
+    }
+
+    await conn.commit();
+    res.json({ success: true, data });
+  } catch (err) {
+    await conn.rollback();
+    console.error(err);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    conn.release();
+  }
+});
 app.get("/buyers", async (req, res) => {
   try {
-    const limit = Number(req.query.limit || 50);
+    const sellerId = Number(req.query.seller_id);
+    const limit = Math.min(Number(req.query.limit || 50), 100);
     const offset = Number(req.query.offset || 0);
-
     const search = req.query.search || "";
     const country = req.query.country || "";
     const product = req.query.product || "";
@@ -419,60 +601,90 @@ app.get("/buyers", async (req, res) => {
 
     if (search) {
       where.push(`(
-        b.company_name LIKE ?
-        OR b.country LIKE ?
-        OR b.product LIKE ?
-        OR b.hsn_code LIKE ?
-        OR b.website LIKE ?
+        b.company_name LIKE ? OR b.country LIKE ? OR b.product LIKE ?
+        OR b.hsn_code LIKE ? OR b.website LIKE ?
       )`);
       values.push(`%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`);
     }
-
-    if (country) {
-      where.push(`b.country = ?`);
-      values.push(country);
-    }
-
-    if (product) {
-      where.push(`b.product = ?`);
-      values.push(product);
-    }
+    if (country) { where.push("b.country = ?"); values.push(country); }
+    if (product) { where.push("b.product = ?"); values.push(product); }
 
     const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
 
-    const sql = `
-      SELECT
-        b.id AS buyer_id,
-        b.buyer_date,
-        b.product,
-        b.hsn_code,
-        b.country,
-        b.company_name,
-        b.website,
-        GROUP_CONCAT(DISTINCT bc.contact_number SEPARATOR ', ') AS contacts,
-        GROUP_CONCAT(DISTINCT be.email SEPARATOR ', ') AS emails
-      FROM buyers b
-      LEFT JOIN buyer_contacts bc ON b.id = bc.buyer_id
-      LEFT JOIN buyer_emails be ON b.id = be.buyer_id
-      ${whereClause}
-      GROUP BY b.id
-      ORDER BY b.id DESC
-      LIMIT ? OFFSET ?
-    `;
-
-    const [rows] = await pool.query(sql, [...values, limit, offset]);
+    // Get total count for pagination UI
     const [countRows] = await pool.query(
       `SELECT COUNT(*) AS total FROM buyers b ${whereClause}`,
       values
     );
+    const total = countRows[0].total;
 
-    res.json({ data: rows, total: countRows[0].total });
+    const sql = `
+      SELECT
+        b.id AS buyer_id, b.buyer_date, b.product, b.hsn_code, b.country,
+        b.company_name, b.website,
+        EXISTS(
+          SELECT 1 FROM contact_reveal_history
+          WHERE seller_id = ? AND buyer_id = b.id AND reveal_type = 'phone'
+        ) AS phone_revealed,
+        EXISTS(
+          SELECT 1 FROM contact_reveal_history
+          WHERE seller_id = ? AND buyer_id = b.id AND reveal_type = 'email'
+        ) AS email_revealed
+      FROM buyers b
+      ${whereClause}
+      ORDER BY b.id DESC
+      LIMIT ? OFFSET ?
+    `;
 
+    const [rows] = await pool.query(sql, [sellerId, sellerId, ...values, limit, offset]);
+
+    const revealedPhoneIds = rows.filter(r => r.phone_revealed).map(r => r.buyer_id);
+    const revealedEmailIds = rows.filter(r => r.email_revealed).map(r => r.buyer_id);
+
+    let contactsMap = {};
+    let emailsMap = {};
+
+    if (revealedPhoneIds.length) {
+      const [contactRows] = await pool.query(
+        `SELECT buyer_id, GROUP_CONCAT(DISTINCT contact_number SEPARATOR ', ') AS contacts
+         FROM buyer_contacts WHERE buyer_id IN (?) GROUP BY buyer_id`,
+        [revealedPhoneIds]
+      );
+      contactsMap = Object.fromEntries(contactRows.map(r => [r.buyer_id, r.contacts]));
+    }
+
+    if (revealedEmailIds.length) {
+      const [emailRows] = await pool.query(
+        `SELECT buyer_id, GROUP_CONCAT(DISTINCT email SEPARATOR ', ') AS emails
+         FROM buyer_emails WHERE buyer_id IN (?) GROUP BY buyer_id`,
+        [revealedEmailIds]
+      );
+      emailsMap = Object.fromEntries(emailRows.map(r => [r.buyer_id, r.emails]));
+    }
+
+    const data = rows.map(r => ({
+      ...r,
+      contacts: r.phone_revealed ? (contactsMap[r.buyer_id] || null) : null,
+      emails: r.email_revealed ? (emailsMap[r.buyer_id] || null) : null,
+    }));
+
+    res.json({
+      success: true,
+      data,
+      total,          // <-- frontend needs this
+      offset,
+      limit,
+      has_more: offset + rows.length < total,
+    });
   } catch (err) {
-    console.error("GET /buyers ERROR:", err);
-    res.status(500).json({ error: err.message });
+    console.error(err);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
+
+
+
+
 
 app.get("/filters/buyer-countries", async (req, res) => {
   try {
@@ -501,190 +713,203 @@ app.get("/filters/products", async (req, res) => {
 });
 app.get("/buyers/:id", async (req, res) => {
   try {
-    const { id } = req.params;
+    const buyerId = Number(req.params.id);
+    const sellerId = Number(req.query.seller_id);
 
-    const sql = `
-      SELECT
-        b.*,
-        GROUP_CONCAT(DISTINCT bc.contact_number SEPARATOR ', ') AS contacts,
-        GROUP_CONCAT(DISTINCT be.email SEPARATOR ', ') AS emails
-      FROM buyers b
-      LEFT JOIN buyer_contacts bc ON b.id = bc.buyer_id
-      LEFT JOIN buyer_emails be ON b.id = be.buyer_id
-      WHERE b.id = ?
-      GROUP BY b.id
-    `;
+    // Step 1: fetch buyer + reveal status ONLY — no contact/email tables touched
+    const [buyerRows] = await pool.query(
+      `SELECT b.*,
+         EXISTS(
+           SELECT 1 FROM contact_reveal_history
+           WHERE seller_id = ? AND buyer_id = b.id AND reveal_type = 'phone'
+         ) AS phone_revealed,
+         EXISTS(
+           SELECT 1 FROM contact_reveal_history
+           WHERE seller_id = ? AND buyer_id = b.id AND reveal_type = 'email'
+         ) AS email_revealed
+       FROM buyers b
+       WHERE b.id = ?`,
+      [sellerId, sellerId, buyerId]
+    );
 
-    const [rows] = await pool.query(sql, [id]);
-
-    if (rows.length === 0) {
-      return res.status(404).json({ error: "Buyer not found" });
+    if (buyerRows.length === 0) {
+      return res.status(404).json({ success: false, error: "Buyer not found" });
     }
 
-    res.json({ data: rows[0] });
+    const buyer = buyerRows[0];
+
+    // Step 2: only query real contact/email data if it was actually revealed
+    if (buyer.phone_revealed) {
+      const [contactRows] = await pool.query(
+        `SELECT GROUP_CONCAT(DISTINCT contact_number SEPARATOR ', ') AS contacts
+         FROM buyer_contacts WHERE buyer_id = ?`,
+        [buyerId]
+      );
+      buyer.contacts = contactRows[0]?.contacts || null;
+    } else {
+      buyer.contacts = null; // frontend shows lock icon instead
+    }
+
+    if (buyer.email_revealed) {
+      const [emailRows] = await pool.query(
+        `SELECT GROUP_CONCAT(DISTINCT email SEPARATOR ', ') AS emails
+         FROM buyer_emails WHERE buyer_id = ?`,
+        [buyerId]
+      );
+      buyer.emails = emailRows[0]?.emails || null;
+    } else {
+      buyer.emails = null;
+    }
+
+    res.json({ success: true, data: buyer });
   } catch (err) {
     console.error("GET /buyers/:id ERROR:", err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
+// ==================== ULTRA-FAST HISTORY LIST API ====================
 app.get('/history', async (req, res) => {
-  const { seller_id } = req.query;
-  console.log('GET /history called with seller_id:', seller_id);
-  
+  const { 
+    seller_id, 
+    page = 1, 
+    limit = 10, 
+    search = '', 
+    product = '' 
+  } = req.query;
+
   if (!seller_id) {
     return res.status(400).json({ error: 'seller_id is required' });
   }
 
   try {
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const offset = (pageNum - 1) * limitNum;
+
+    // Build WHERE conditions for history batches
+    let whereConditions = ['ehc.seller_id = ?'];
+    let values = [seller_id];
+
+    // Search filter
+    if (search) {
+      whereConditions.push(`ehc.product_name LIKE ?`);
+      values.push(`%${search}%`);
+    }
+
+    // Product filter
+    if (product) {
+      whereConditions.push(`ehc.product_name = ?`);
+      values.push(product);
+    }
+
+    const whereClause = whereConditions.join(' AND ');
+
+    // Get total count of unique batches
+    const [countResult] = await pool.query(`
+      SELECT COUNT(DISTINCT ehc.batch_id) as total
+      FROM email_history_companies ehc
+      WHERE ${whereClause}
+    `, values);
+    const totalBatches = countResult[0]?.total || 0;
+
+    // Get paginated batches
     const [batches] = await pool.query(`
-      SELECT DISTINCT
-        batch_id,
-        MAX(product_name) as product_name,
-        MAX(sent_at) as sent_at,
-        MAX(multiple_products) as multiple_products,
-        MAX(CASE WHEN template_used IS NOT NULL THEN template_used END) as template_used
-      FROM email_history_companies
-      WHERE seller_id = ?
-      GROUP BY batch_id
-      ORDER BY MAX(sent_at) DESC
-    `, [seller_id]);
+      SELECT 
+        ehc.batch_id,
+        MAX(ehc.product_name) as product_name,
+        MAX(ehc.sent_at) as sent_at,
+        MAX(ehc.multiple_products) as multiple_products,
+        MAX(ehc.template_used) as template_used,
+        COUNT(*) as total_companies,
+        SUM(CASE WHEN ehc.message IS NOT NULL AND ehc.message <> '' THEN 1 ELSE 0 END) as replied_count,
+        SUM(CASE WHEN ehc.response = 'interested' THEN 1 ELSE 0 END) as interested_count,
+        SUM(CASE WHEN ehc.response = 'not_interested' THEN 1 ELSE 0 END) as not_interested_count
+      FROM email_history_companies ehc
+      WHERE ${whereClause}
+      GROUP BY ehc.batch_id
+      ORDER BY MAX(ehc.sent_at) DESC
+      LIMIT ? OFFSET ?
+    `, [...values, limitNum, offset]);
 
-    const historyData = await Promise.all(
-      batches.map(async (batch) => {
-        const [results] = await pool.query(
-          `
-          SELECT
-            batch_id AS id,
-            product_name AS product,
-            company_name,
-            contact_name,
-            email,
-            sent_at,
-            status,
-            response,
-            responded_at,
-            template_used,
-            message,
-            reply_date,
-            subject
-          FROM email_history_companies
-          WHERE batch_id = ? AND seller_id = ?
-          ORDER BY sent_at DESC
-          `,
-          [batch.batch_id, seller_id]
-        );
+    const historyData = [];
 
-        if (!results.length) return null;
+    for (const batch of batches) {
+      const [companies] = await pool.query(`
+        SELECT
+          company_name,
+          contact_name,
+          email,
+          sent_at,
+          response,
+          template_used,
+          message,
+          reply_date,
+          subject,
+          product_name
+        FROM email_history_companies
+        WHERE batch_id = ? AND seller_id = ?
+        ORDER BY sent_at DESC
+      `, [batch.batch_id, seller_id]);
 
-        // Calculate counts
-        const counts = {
-          total: results.length,
-          replied: results.filter(row => row.message && row.message.trim() !== '').length,
-          interested: results.filter(row => row.response === 'interested').length,
-          notInterested: results.filter(row => row.response === 'not_interested').length,
-          emailSent: results.filter(row => row.status === 'sent' || row.response === null).length
-        };
+      const companiesList = companies.map(row => {
+        const hasMessage = row.message && row.message.trim() !== '';
+        const isInterested = row.response === 'interested';
+        const isNotInterested = row.response === 'not_interested';
 
-        // ✅ FIX: Build companies array with combined statuses
-        const companies = results.map((row) => {
-          let displayStatus = 'Email Sent';
-
-          const hasMessage = row.message && row.message.trim() !== '';
-          const isInterested = row.response === 'interested';
-          const isNotInterested = row.response === 'not_interested';
-
-          // ✅ Handle ALL combinations
-          if (hasMessage && isInterested) {
-            displayStatus = 'Replied, Interested';
-          } else if (hasMessage && isNotInterested) {
-            displayStatus = 'Replied, Not Interested';
-          } else if (hasMessage) {
-            displayStatus = 'Replied';
-          } else if (isInterested) {
-            displayStatus = 'Interested';
-          } else if (isNotInterested) {
-            displayStatus = 'Not Interested';
-          }
-
-          // Clean the message - take only the first line
-          let cleanedMessage = null;
-          let cleanedSubject = row.subject;
-          
-          if (row.message && row.message.trim() !== '') {
-            const firstLine = row.message.split('\n')[0];
-            cleanedMessage = firstLine.trim();
-          }
-
-          return {
-            companyName: row.company_name,
-            contactName: row.contact_name,
-            email: row.email,
-            sentAt: row.sent_at,
-            response: row.response,
-            respondedAt: row.reply_date || row.responded_at,
-            status: displayStatus,
-            templateUsed: row.template_used,
-            subject: cleanedSubject,
-            message: cleanedMessage,
-            product: row.product,
-            // Add individual flags for frontend
-            hasReply: hasMessage,
-            isInterested: isInterested,
-            isNotInterested: isNotInterested
-          };
-        });
-
-        let mainProduct = results[0]?.product || batch.product_name;
-        if (batch.multiple_products === 1) {
-          mainProduct = "General Products";
-        }
+        let status = 'Email Sent';
+        if (hasMessage && isInterested) status = 'Replied, Interested';
+        else if (hasMessage && isNotInterested) status = 'Replied, Not Interested';
+        else if (hasMessage) status = 'Replied';
+        else if (isInterested) status = 'Interested';
+        else if (isNotInterested) status = 'Not Interested';
 
         return {
-          id: batch.batch_id,
-          product: mainProduct,
-          multiple_products: batch.multiple_products,
-          date: batch.sent_at,
-          companies,
-          counts,
-          summary: {
-            hasInterested: counts.interested > 0,
-            hasReplied: counts.replied > 0,
-            hasNotInterested: counts.notInterested > 0,
-            allSent: counts.emailSent === counts.total,
-            allReplied: counts.replied === counts.total
-          }
+          companyName: row.company_name,
+          contactName: row.contact_name,
+          email: row.email,
+          sentAt: row.sent_at,
+          response: row.response,
+          respondedAt: row.reply_date,
+          status,
+          templateUsed: row.template_used,
+          subject: row.subject,
+          message: hasMessage ? row.message.split('\n')[0].trim() : null,
+          product: row.product_name,
+          hasReply: hasMessage,
+          isInterested,
+          isNotInterested
         };
-      })
-    );
+      });
 
-    // Filter out null results
-    const filteredData = historyData.filter(item => item !== null);
-    
-    // Remove duplicates by batch_id
-    const uniqueData = filteredData.reduce((acc, current) => {
-      const existing = acc.find(item => item.id === current.id);
-      if (!existing) {
-        acc.push(current);
-      }
-      return acc;
-    }, []);
+      const mainProduct = batch.multiple_products === 1 ? "General Products" : batch.product_name;
 
-    // Sort by date (newest first) and then by priority (interested first)
-    uniqueData.sort((a, b) => {
-      const dateCompare = new Date(b.date) - new Date(a.date);
-      if (dateCompare !== 0) return dateCompare;
-      
-      if (a.counts.interested > 0 && b.counts.interested === 0) return -1;
-      if (a.counts.interested === 0 && b.counts.interested > 0) return 1;
-      
-      return 0;
-    });
+      historyData.push({
+        id: batch.batch_id,
+        product: mainProduct,
+        multiple_products: batch.multiple_products,
+        date: batch.sent_at,
+        companies: companiesList,
+        counts: {
+          total: batch.total_companies,
+          replied: batch.replied_count,
+          interested: batch.interested_count,
+          notInterested: batch.not_interested_count,
+          emailSent: batch.total_companies - batch.replied_count
+        }
+      });
+    }
 
     res.json({
       success: true,
-      total: uniqueData.length,
-      data: uniqueData
+      total: totalBatches,
+      data: historyData,
+      pagination: {
+        currentPage: pageNum,
+        totalPages: Math.ceil(totalBatches / limitNum),
+        totalItems: totalBatches,
+        itemsPerPage: limitNum
+      }
     });
 
   } catch (err) {
@@ -692,6 +917,99 @@ app.get('/history', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+app.get('/history/stats', async (req, res) => {
+  const { seller_id } = req.query;
+
+  if (!seller_id) {
+    return res.status(400).json({ error: 'seller_id is required' });
+  }
+
+  try {
+    // Get total entries (batches)
+    const [batchResult] = await pool.query(`
+      SELECT COUNT(DISTINCT batch_id) as total_entries
+      FROM email_history_companies
+      WHERE seller_id = ?
+    `, [seller_id]);
+
+    // Get total companies contacted
+    const [companyResult] = await pool.query(`
+      SELECT COUNT(DISTINCT buyer_id) as total_companies
+      FROM email_history_companies
+      WHERE seller_id = ?
+    `, [seller_id]);
+
+    // Get total replied
+    const [repliedResult] = await pool.query(`
+      SELECT COUNT(DISTINCT buyer_id) as total_replied
+      FROM email_history_companies
+      WHERE seller_id = ? 
+      AND (message IS NOT NULL AND message <> '')
+    `, [seller_id]);
+
+    // Get total interested
+    const [interestedResult] = await pool.query(`
+      SELECT COUNT(DISTINCT buyer_id) as total_interested
+      FROM email_history_companies
+      WHERE seller_id = ? AND response = 'interested'
+    `, [seller_id]);
+
+    // Get total not interested
+    const [notInterestedResult] = await pool.query(`
+      SELECT COUNT(DISTINCT buyer_id) as total_not_interested
+      FROM email_history_companies
+      WHERE seller_id = ? AND response = 'not_interested'
+    `, [seller_id]);
+
+    const totalEntries = batchResult[0]?.total_entries || 0;
+    const totalCompanies = companyResult[0]?.total_companies || 0;
+    const totalReplied = repliedResult[0]?.total_replied || 0;
+    const totalInterested = interestedResult[0]?.total_interested || 0;
+    const totalNotInterested = notInterestedResult[0]?.total_not_interested || 0;
+
+    res.json({
+      success: true,
+      data: {
+        totalEntries,
+        totalCompanies,
+        totalReplied,
+        totalInterested,
+        totalNotInterested,
+        responseRate: totalCompanies > 0 ? Math.round((totalReplied / totalCompanies) * 100) : 0,
+        interestedRate: totalCompanies > 0 ? Math.round((totalInterested / totalCompanies) * 100) : 0
+      }
+    });
+
+  } catch (err) {
+    console.error('GET /history/stats error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/history/products', async (req, res) => {
+  const { seller_id } = req.query;
+
+  if (!seller_id) {
+    return res.status(400).json({ error: 'seller_id is required' });
+  }
+
+  try {
+    const [products] = await pool.query(`
+      SELECT DISTINCT product_name as product
+      FROM email_history_companies
+      WHERE seller_id = ? 
+      AND product_name IS NOT NULL 
+      AND product_name <> ''
+      ORDER BY product_name
+    `, [seller_id]);
+
+    res.json(products);
+  } catch (err) {
+    console.error('GET /history/products error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Add this helper function at the top of your server.js
 function generateUUID() {
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
@@ -792,93 +1110,98 @@ app.post('/api/store-response', async (req, res) => {
 app.get('/history/:id', async (req, res) => {
   try {
     const { id } = req.params;
+    const { seller_id, page = 1, limit = 10 } = req.query;
 
-    const [results] = await pool.query(
-      `
+    if (!seller_id) {
+      return res.status(400).json({
+        success: false,
+        message: "seller_id is required"
+      });
+    }
+
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const offset = (pageNum - 1) * limitNum;
+
+    // Get total count of companies in this batch
+    const [countResult] = await pool.query(`
+      SELECT COUNT(*) as total
+      FROM email_history_companies
+      WHERE batch_id = ? AND seller_id = ?
+    `, [id, seller_id]);
+
+    const totalCompanies = countResult[0]?.total || 0;
+
+    // Get batch info (first row to get product and metadata)
+    const [batchInfo] = await pool.query(`
       SELECT
         batch_id AS id,
         product_name AS product,
-        company_name,
-        contact_name,
-        email,
-        sent_at,
-        status,
-        response,
-        responded_at,
-        template_used,
-        message,
-        reply_date,
-        subject,
-        multiple_products
+        multiple_products,
+        MAX(sent_at) AS sent_at
       FROM email_history_companies
-      WHERE batch_id = ?
-      ORDER BY sent_at DESC
-      `,
-      [id]
-    );
+      WHERE batch_id = ? AND seller_id = ?
+      GROUP BY batch_id, product_name, multiple_products
+    `, [id, seller_id]);
 
-    console.log(`Found ${results.length} records for batch ${id}`);
-
-    if (!results.length) {
+    if (!batchInfo.length) {
       return res.status(404).json({
         success: false,
         message: 'History not found'
       });
     }
 
-    // Calculate counts
-    const counts = {
-      total: results.length,
+    // Get paginated companies
+    const [results] = await pool.query(`
+      SELECT
+        company_name,
+        contact_name,
+        email,
+        sent_at,
+        response,
+        template_used,
+        message,
+        reply_date,
+        subject,
+        product_name AS product,
+        status
+      FROM email_history_companies
+      WHERE batch_id = ? AND seller_id = ?
+      ORDER BY sent_at DESC
+      LIMIT ? OFFSET ?
+    `, [id, seller_id, limitNum, offset]);
+
+    // Get counts (total across all pages)
+    const [countsResult] = await pool.query(`
+      SELECT
+        COUNT(*) as total,
+        SUM(CASE WHEN message IS NOT NULL AND message <> '' THEN 1 ELSE 0 END) as replied,
+        SUM(CASE WHEN response = 'interested' THEN 1 ELSE 0 END) as interested,
+        SUM(CASE WHEN response = 'not_interested' THEN 1 ELSE 0 END) as not_interested,
+        SUM(CASE WHEN status = 'sent' OR response IS NULL THEN 1 ELSE 0 END) as emailSent
+      FROM email_history_companies
+      WHERE batch_id = ? AND seller_id = ?
+    `, [id, seller_id]);
+
+    const counts = countsResult[0] || {
+      total: 0,
       replied: 0,
       interested: 0,
-      notInterested: 0,
+      not_interested: 0,
       emailSent: 0
     };
 
-    results.forEach((row) => {
-      if (row.message && row.message.trim() !== '') {
-        counts.replied++;
-      }
-      if (row.response === 'interested') {
-        counts.interested++;
-      }
-      if (row.response === 'not_interested') {
-        counts.notInterested++;
-      }
-      if (row.status === 'sent' || row.response === null) {
-        counts.emailSent++;
-      }
-    });
-
-    // Build companies array
-    const companies = results.map((row) => {
-      let displayStatus = 'Email Sent';
-
+    const companies = results.map(row => {
       const hasMessage = row.message && row.message.trim() !== '';
       const isInterested = row.response === 'interested';
       const isNotInterested = row.response === 'not_interested';
 
-      // ✅ Handle ALL combinations
-      if (hasMessage && isInterested) {
-        displayStatus = 'Replied, Interested';
-      } else if (hasMessage && isNotInterested) {
-        displayStatus = 'Replied, Not Interested';
-      } else if (hasMessage) {
-        displayStatus = 'Replied';
-      } else if (isInterested) {
-        displayStatus = 'Interested';
-      } else if (isNotInterested) {
-        displayStatus = 'Not Interested';
-      }
-
-      // Clean the message - take only the first line
-      let cleanedMessage = null;
-      let cleanedSubject = row.subject;
-      
-      if (row.message && row.message.trim() !== '') {
-        const firstLine = row.message.split('\n')[0];
-        cleanedMessage = firstLine.trim();
-      }
+      let status = 'Email Sent';
+      if (hasMessage && isInterested) status = 'Replied, Interested';
+      else if (hasMessage && isNotInterested) status = 'Replied, Not Interested';
+      else if (hasMessage) status = 'Replied';
+      else if (isInterested) status = 'Interested';
+      else if (isNotInterested) status = 'Not Interested';
 
       return {
         companyName: row.company_name,
@@ -886,35 +1209,43 @@ app.get('/history/:id', async (req, res) => {
         email: row.email,
         sentAt: row.sent_at,
         response: row.response,
-        respondedAt: row.reply_date || row.responded_at,
-        status: displayStatus,
+        respondedAt: row.reply_date,
+        status,
         templateUsed: row.template_used,
-        subject: cleanedSubject,
-        message: cleanedMessage,
+        subject: row.subject,
+        message: hasMessage ? row.message.split('\n')[0].trim() : null,
         product: row.product,
-        // Add individual flags for frontend
         hasReply: hasMessage,
-        isInterested: isInterested,
-        isNotInterested: isNotInterested
+        isInterested,
+        isNotInterested
       };
     });
 
-    // Get multiple_products value from first row
-    const multipleProducts = results[0].multiple_products;
-
-    // Determine main product display
-    let mainProduct = results[0].product;
-    if (multipleProducts === 1) {
-      mainProduct = "General Products";
-    }
+    const multipleProducts = batchInfo[0].multiple_products;
+    const mainProduct = multipleProducts === 1 ? "General Products" : batchInfo[0].product;
 
     res.json({
-      id: results[0].id,
-      product: mainProduct,
-      multiple_products: multipleProducts,
-      date: results[0].sent_at,
-      companies,
-      counts
+      success: true,
+      data: {
+        id: batchInfo[0].id,
+        product: mainProduct,
+        multiple_products: multipleProducts,
+        date: batchInfo[0].sent_at,
+        companies: companies,
+        counts: {
+          total: counts.total || 0,
+          replied: counts.replied || 0,
+          interested: counts.interested || 0,
+          notInterested: counts.not_interested || 0,
+          emailSent: counts.emailSent || 0
+        }
+      },
+      pagination: {
+        currentPage: pageNum,
+        totalPages: Math.ceil(totalCompanies / limitNum),
+        totalItems: totalCompanies,
+        itemsPerPage: limitNum
+      }
     });
 
   } catch (err) {
@@ -925,7 +1256,6 @@ app.get('/history/:id', async (req, res) => {
     });
   }
 });
-
 
 app.get('/api/admin/history', async (req, res) => {
   console.log('GET /api/admin/history called');
@@ -1273,15 +1603,195 @@ app.get('/api/admin/history/:id', async (req, res) => {
 });
 
 
+app.get('/api/contacts/stats', async (req, res) => {
+  const { seller_id } = req.query;
 
+  if (!seller_id) {
+    return res.status(400).json({ success: false, message: "seller_id is required" });
+  }
 
-// Add this endpoint after the /api/seller/login endpoint
+  try {
+    // Get total distinct buyers
+    const [totalResult] = await pool.query(`
+      SELECT COUNT(DISTINCT buyer_id) as total
+      FROM email_history_companies
+      WHERE seller_id = ?
+    `, [seller_id]);
 
-// ============================================
-// API: Store User in Local Database
-// ============================================
+    // Get interested count
+    const [interestedResult] = await pool.query(`
+      SELECT COUNT(DISTINCT buyer_id) as interested
+      FROM email_history_companies
+      WHERE seller_id = ? AND response = 'interested'
+    `, [seller_id]);
 
+    // Get not_interested count
+    const [notInterestedResult] = await pool.query(`
+      SELECT COUNT(DISTINCT buyer_id) as not_interested
+      FROM email_history_companies
+      WHERE seller_id = ? AND response = 'not_interested'
+    `, [seller_id]);
 
+    // Get pending count (no response yet)
+    const [pendingResult] = await pool.query(`
+      SELECT COUNT(DISTINCT buyer_id) as pending
+      FROM email_history_companies
+      WHERE seller_id = ? AND (response IS NULL OR response = '')
+    `, [seller_id]);
+
+    const total = totalResult[0]?.total || 0;
+    const interested = interestedResult[0]?.interested || 0;
+    const not_interested = notInterestedResult[0]?.not_interested || 0;
+    const pending = pendingResult[0]?.pending || 0;
+
+    console.log('Stats for seller:', seller_id, { total, interested, not_interested, pending });
+
+    res.json({
+      success: true,
+      data: {
+        total: total,
+        interested: interested,
+        not_interested: not_interested,
+        pending: pending
+      }
+    });
+
+  } catch (error) {
+    console.error("Error fetching contacts stats:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Error fetching contacts stats", 
+      error: error.message 
+    });
+  }
+});
+app.get('/api/contacts/templates', async (req, res) => {
+  const { seller_id } = req.query;
+
+  if (!seller_id) {
+    return res.status(400).json({ success: false, message: "seller_id is required" });
+  }
+
+  try {
+    const [templates] = await pool.query(`
+      SELECT DISTINCT template_used as template
+      FROM email_history_companies 
+      WHERE seller_id = ? 
+      AND template_used IS NOT NULL 
+      AND template_used != ''
+      ORDER BY template_used
+      LIMIT 100
+    `, [seller_id]);
+
+    res.json(templates);
+  } catch (error) {
+    console.error("Error fetching contacts templates:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Error fetching templates", 
+      error: error.message 
+    });
+  }
+});
+app.get('/api/contacts/search', async (req, res) => {
+  const { seller_id, q = '', page = 1, limit = 10 } = req.query;
+
+  if (!seller_id) {
+    return res.status(400).json({ success: false, message: "seller_id is required" });
+  }
+
+  try {
+    const offset = (Number(page) - 1) * Number(limit);
+    const limitNum = Number(limit);
+
+    const searchPattern = `%${q}%`;
+
+    const [results] = await pool.query(`
+      SELECT 
+        buyer_id,
+        MAX(contact_name) as contact_name,
+        MAX(from_email) as from_email,
+        MAX(to_email) as to_email,
+        MAX(company_name) as company_name,
+        MAX(country) as country,
+        MAX(product_name) as product_name,
+        MAX(template_used) as template_used,
+        COUNT(*) as interaction_count,
+        MAX(CASE WHEN LOWER(status) = 'sent' THEN 1 ELSE 0 END) as has_sent,
+        MAX(CASE WHEN LOWER(response) = 'interested' THEN 1 ELSE 0 END) as has_interested,
+        MAX(CASE WHEN LOWER(response) = 'not_interested' THEN 1 ELSE 0 END) as has_not_interested,
+        MAX(CASE WHEN reply_date IS NOT NULL OR responded_at IS NOT NULL THEN 1 ELSE 0 END) as has_replied,
+        MAX(COALESCE(reply_date, responded_at, sent_at)) as last_interaction,
+        MAX(email) as email
+      FROM email_history_companies
+      WHERE seller_id = ?
+        AND (
+          company_name LIKE ? OR 
+          country LIKE ? OR 
+          product_name LIKE ? OR 
+          contact_name LIKE ? OR 
+          to_email LIKE ? OR
+          from_email LIKE ? OR
+          email LIKE ?
+        )
+      GROUP BY buyer_id
+      ORDER BY last_interaction DESC
+      LIMIT ? OFFSET ?
+    `, [seller_id, searchPattern, searchPattern, searchPattern, searchPattern, searchPattern, searchPattern, searchPattern, limitNum, offset]);
+
+    const [countResult] = await pool.query(`
+      SELECT COUNT(DISTINCT buyer_id) as total
+      FROM email_history_companies
+      WHERE seller_id = ?
+        AND (
+          company_name LIKE ? OR 
+          country LIKE ? OR 
+          product_name LIKE ? OR 
+          contact_name LIKE ? OR 
+          to_email LIKE ? OR
+          from_email LIKE ? OR
+          email LIKE ?
+        )
+    `, [seller_id, searchPattern, searchPattern, searchPattern, searchPattern, searchPattern, searchPattern, searchPattern]);
+
+    const cleanedResults = results.map(contact => ({
+      buyer_id: contact.buyer_id,
+      contact_name: contact.contact_name || 'Unknown',
+      from_email: contact.from_email || '',
+      to_email: contact.to_email || '',
+      company_name: contact.company_name || '',
+      country: contact.country || '',
+      product_name: contact.product_name || '',
+      template_used: contact.template_used || '',
+      phone: contact.contact_name && contact.contact_name.match(/^\+?\d+$/) ? contact.contact_name : '',
+      interaction_count: contact.interaction_count,
+      status: contact.has_sent ? 'sent' : 'pending',
+      response: contact.has_interested ? 'interested' : contact.has_not_interested ? 'not_interested' : contact.has_replied ? 'replied' : null,
+      email: contact.email || contact.from_email || '',
+      last_interaction: contact.last_interaction
+    }));
+
+    res.json({
+      success: true,
+      data: cleanedResults,
+      total: countResult[0]?.total || 0,
+      pagination: {
+        total: countResult[0]?.total || 0,
+        page: Number(page),
+        limit: limitNum,
+        totalPages: Math.ceil((countResult[0]?.total || 0) / limitNum)
+      }
+    });
+
+  } catch (error) {
+    console.error("Error searching contacts:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Error searching contacts", 
+      error: error.message 
+    });
+  }
+});
 app.get('/history/:id/replies', async (req, res) => {
   try {
     const { id } = req.params;
@@ -1354,94 +1864,192 @@ app.delete("/email-templates/:id", async (req, res) => {
 });
 
 app.get('/api/contacts', async (req, res) => {
-  const { seller_id } = req.query;
+  const { 
+    seller_id, 
+    search = '', 
+    template = '',
+    response_type = '',
+    page = 1, 
+    limit = 10 
+  } = req.query;
 
   if (!seller_id) {
     return res.status(400).json({ success: false, message: "seller_id is required" });
   }
 
   try {
-    // Get only records that are either 'interested' OR have a reply (message is not null)
-    const query = `
-      SELECT 
-        buyer_id,
-        MAX(contact_name) as contact_name,
-        MAX(from_email) as from_email,
-        MAX(to_email) as to_email,
-        MAX(company_name) as company_name,
-        MAX(country) as country,
-        MAX(product_name) as product_name,
-        MAX(template_used) as template_used,
-        COUNT(*) as interaction_count,
-        MAX(CASE WHEN LOWER(status) = 'sent' THEN 1 ELSE 0 END) as has_sent,
-        MAX(CASE WHEN LOWER(response) = 'interested' THEN 1 ELSE 0 END) as has_interested,
-        MAX(COALESCE(reply_date, responded_at, sent_at)) as last_interaction
-      FROM email_history_companies
-      WHERE buyer_id IS NOT NULL
-        AND seller_id = ?
-        AND (
-          LOWER(response) = 'interested' 
-          OR (message IS NOT NULL AND message != '')
-        )
-      GROUP BY buyer_id
-      ORDER BY last_interaction DESC
-    `;
+    const offset = (Number(page) - 1) * Number(limit);
+    const limitNum = Number(limit);
 
-    const [groupedResults] = await pool.query(query, [seller_id]);
+    // Build WHERE conditions - SIMPLE like Search page
+    let whereConditions = ['e.seller_id = ?'];
+    let values = [seller_id];
 
-    if (groupedResults.length === 0) {
-      return res.status(404).json({ success: false, message: "No interested or replied contacts found" });
+    // Search filter - SIMPLE LIKE (same as Search page)
+    if (search) {
+      const searchPattern = `%${search}%`;
+      whereConditions.push(`(
+        e.company_name LIKE ? OR 
+        e.product_name LIKE ? OR 
+        e.contact_name LIKE ? OR 
+        e.email LIKE ?
+      )`);
+      values.push(searchPattern, searchPattern, searchPattern, searchPattern);
     }
 
-    const cleanedResults = groupedResults.map(contact => {
-      let cleanedProductName = contact.product_name || '';
-      let cleanedTemplate = contact.template_used || '';
-      
-      const phoneNumber = contact.contact_name && contact.contact_name.match(/^\+?\d+$/) 
-        ? contact.contact_name 
-        : '';
+    // Template filter
+    if (template && template !== 'all') {
+      whereConditions.push(`e.template_used = ?`);
+      values.push(template);
+    }
 
-      return {
-        buyer_id: contact.buyer_id,
-        contact_name: contact.contact_name || 'Unknown',
-        from_email: contact.from_email || '',
-        to_email: contact.to_email || '',
-        company_name: contact.company_name || '',
-        country: contact.country || '',
-        product_name: cleanedProductName,
-        template_used: cleanedTemplate,
-        phone: phoneNumber,
-        interaction_count: contact.interaction_count,
-        status: contact.has_sent ? 'sent' : 'pending',
-        response: contact.has_interested ? 'interested' : 'replied', // 'interested' or 'replied'
-        last_interaction: contact.last_interaction
-      };
+    // Response type filter
+    if (response_type && response_type !== 'all') {
+      if (response_type === 'interested') {
+        whereConditions.push(`e.response = 'interested'`);
+      } else if (response_type === 'not_interested') {
+        whereConditions.push(`e.response = 'not_interested'`);
+      } else if (response_type === 'replied') {
+        whereConditions.push(`(e.reply_date IS NOT NULL OR e.responded_at IS NOT NULL)`);
+      } else if (response_type === 'sent') {
+        whereConditions.push(`e.status = 'sent'`);
+      }
+    }
+
+    const whereClause = whereConditions.length > 0 ? `WHERE ${whereConditions.join(' AND ')}` : '';
+
+    // Get total count - SIMPLE COUNT
+    const countQuery = `
+      SELECT COUNT(DISTINCT e.buyer_id) as total
+      FROM email_history_companies e
+      ${whereClause}
+    `;
+
+    const [countResult] = await pool.query(countQuery, values);
+    const total = countResult[0]?.total || 0;
+
+    // Get paginated contacts - SIMPLE QUERY (like Search page)
+    const query = `
+      SELECT 
+        e.buyer_id,
+        e.contact_name,
+        e.from_email,
+        e.company_name,
+        e.product_name,
+        e.template_used,
+        e.email,
+        e.reply_date,
+        e.responded_at,
+        e.sent_at,
+        e.response,
+        e.status
+      FROM email_history_companies e
+      ${whereClause}
+      ORDER BY COALESCE(e.reply_date, e.responded_at, e.sent_at) DESC
+      LIMIT ? OFFSET ?
+    `;
+
+    const [results] = await pool.query(query, [...values, limitNum, offset]);
+
+    // If no results, return early
+    if (results.length === 0) {
+      return res.json({ 
+        success: true, 
+        data: [],
+        total: 0,
+        pagination: {
+          total: 0,
+          page: Number(page),
+          limit: limitNum,
+          totalPages: 0
+        }
+      });
+    }
+
+    // Process results - GROUP BY in JavaScript (not in SQL)
+    const contactMap = new Map();
+
+    results.forEach(row => {
+      if (!contactMap.has(row.buyer_id)) {
+        contactMap.set(row.buyer_id, {
+          buyer_id: row.buyer_id,
+          contact_name: row.contact_name || 'Unknown',
+          from_email: row.from_email || '',
+          company_name: row.company_name || '',
+          product_name: row.product_name || '',
+          template_used: row.template_used || '',
+          phone: row.contact_name && row.contact_name.match(/^\+?\d+$/) ? row.contact_name : '',
+          interaction_count: 0,
+          response: null,
+          email: row.email || row.from_email || '',
+          last_interaction: row.sent_at || row.reply_date || row.responded_at,
+          has_interested: false,
+          has_not_interested: false,
+          has_replied: false
+        });
+      }
+
+      const contact = contactMap.get(row.buyer_id);
+      contact.interaction_count++;
+
+      if (row.response === 'interested') {
+        contact.has_interested = true;
+        contact.response = 'interested';
+      } else if (row.response === 'not_interested') {
+        contact.has_not_interested = true;
+        contact.response = 'not_interested';
+      } else if (row.reply_date || row.responded_at) {
+        contact.has_replied = true;
+        contact.response = 'replied';
+      }
+
+      // Update last_interaction if this record is newer
+      const recordDate = row.reply_date || row.responded_at || row.sent_at;
+      if (recordDate && (!contact.last_interaction || new Date(recordDate) > new Date(contact.last_interaction))) {
+        contact.last_interaction = recordDate;
+      }
+    });
+
+    // Convert map to array and set final response
+    const cleanedResults = Array.from(contactMap.values()).map(contact => ({
+      ...contact,
+      response: contact.has_interested ? 'interested' : 
+                contact.has_not_interested ? 'not_interested' : 
+                contact.has_replied ? 'replied' : null
+    }));
+
+    // Sort by last_interaction (newest first)
+    cleanedResults.sort((a, b) => {
+      return new Date(b.last_interaction) - new Date(a.last_interaction);
     });
 
     res.json({ 
       success: true, 
-      count: cleanedResults.length, 
-      data: cleanedResults 
+      data: cleanedResults,
+      total: total,
+      pagination: {
+        total: total,
+        page: Number(page),
+        limit: limitNum,
+        totalPages: Math.ceil(total / limitNum)
+      }
     });
 
   } catch (error) {
-    console.error("Error fetching email replies:", error);
+    console.error("Error fetching contacts:", error);
     res.status(500).json({ 
       success: false, 
-      message: "Error fetching email replies", 
+      message: "Error fetching contacts", 
       error: error.message 
     });
   }
 });
-
-
-// Get detailed history for a specific buyer (filtered by seller)
-app.get('/api/replyhistory/:buyerId', async (req, res) => {
+// Get stats for a specific buyer
+app.get('/api/replyhistory/:buyerId/stats', async (req, res) => {
   try {
     const buyerId = req.params.buyerId;
-    const sellerId = req.query.sellerId; // Get sellerId from query params
+    const sellerId = req.query.sellerId;
 
-    // Validate sellerId
     if (!sellerId) {
       return res.status(400).json({
         success: false,
@@ -1451,12 +2059,72 @@ app.get('/api/replyhistory/:buyerId', async (req, res) => {
 
     const query = `
       SELECT 
+        COUNT(*) as total,
+        SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END) as sent,
+        SUM(CASE WHEN response = 'interested' THEN 1 ELSE 0 END) as interested,
+        SUM(CASE WHEN response = 'not_interested' THEN 1 ELSE 0 END) as not_interested,
+        SUM(CASE WHEN response IS NULL OR response = '' THEN 1 ELSE 0 END) as pending
+      FROM email_history_companies
+      WHERE buyer_id = ? AND seller_id = ?
+    `;
+
+    const [results] = await pool.query(query, [buyerId, sellerId]);
+
+    res.json({
+      success: true,
+      data: {
+        total: results[0]?.total || 0,
+        sent: results[0]?.sent || 0,
+        interested: results[0]?.interested || 0,
+        not_interested: results[0]?.not_interested || 0,
+        pending: results[0]?.pending || 0
+      }
+    });
+
+  } catch (error) {
+    console.error("Error fetching contact stats:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error fetching contact stats",
+      error: error.message
+    });
+  }
+});
+
+app.get('/api/replyhistory/:buyerId', async (req, res) => {
+  try {
+    const buyerId = req.params.buyerId;
+    const sellerId = req.query.sellerId;
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const offset = (page - 1) * limit;
+
+    if (!sellerId) {
+      return res.status(400).json({
+        success: false,
+        message: "sellerId is required"
+      });
+    }
+
+    // Get total count
+    const countQuery = `
+      SELECT COUNT(*) as total
+      FROM email_history_companies
+      WHERE buyer_id = ? AND seller_id = ?
+    `;
+    const [countResult] = await pool.query(countQuery, [buyerId, sellerId]);
+    const total = countResult[0]?.total || 0;
+
+    // Get paginated results with email column
+    const query = `
+      SELECT 
         id,
         batch_id,
         buyer_id,
         seller_id,
         from_email,
         to_email,
+        email,
         subject,
         message,
         product_name,
@@ -1472,16 +2140,10 @@ app.get('/api/replyhistory/:buyerId', async (req, res) => {
       FROM email_history_companies
       WHERE buyer_id = ? AND seller_id = ?
       ORDER BY COALESCE(reply_date, responded_at, sent_at) DESC
+      LIMIT ? OFFSET ?
     `;
 
-    const [results] = await pool.query(query, [buyerId, sellerId]);
-
-    if (results.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: "No replies found for this buyer and seller"
-      });
-    }
+    const [results] = await pool.query(query, [buyerId, sellerId, limit, offset]);
 
     // Clean the message and subject for each record
     const cleanedResults = results.map(reply => {
@@ -1531,6 +2193,7 @@ app.get('/api/replyhistory/:buyerId', async (req, res) => {
         buyer_id: reply.buyer_id,
         from_email: reply.from_email,
         to_email: reply.to_email,
+        email: reply.email ,
         subject: cleanedSubject,
         message: cleanedMessage,
         product_name: reply.product_name,
@@ -1549,7 +2212,14 @@ app.get('/api/replyhistory/:buyerId', async (req, res) => {
     res.json({
       success: true,
       count: cleanedResults.length,
-      data: cleanedResults
+      total: total,
+      data: cleanedResults,
+      pagination: {
+        total: total,
+        page: page,
+        limit: limit,
+        totalPages: Math.ceil(total / limit)
+      }
     });
 
   } catch (error) {
@@ -1562,352 +2232,176 @@ app.get('/api/replyhistory/:buyerId', async (req, res) => {
   }
 });
 
-
-// app.get('/api/replyhistory/:id', async (req, res) => {
-//   try {
-//     const { id } = req.params;
-
-//     const query = `
-//       SELECT 
-//         id,
-//         batch_id,
-//         from_email,
-//         to_email,
-//         subject,
-//         message,
-//         product_name,
-//         reply_date,
-//         company_name,
-//         contact_name,
-//         country,
-//         status,
-//         template_used,
-//         response,
-//         responded_at,
-//         sent_at
-//       FROM email_history_companies
-//       WHERE id = ?
-//       LIMIT 1
-//     `;
-
-//     const [results] = await pool.query(query, [id]);
-
-//     if (results.length === 0) {
-//       return res.status(404).json({ success: false, message: "Email reply not found" });
-//     }
-
-//     const reply = results[0];
-
-//     let cleanedSubject = reply.subject || '';
-//     cleanedSubject = cleanedSubject.replace(/\s*\[BATCH:[^\]]+\]/g, '');
-//     cleanedSubject = cleanedSubject.replace(/^Re:\s*/, '');
-
-//     let cleanedMessage = reply.message;
-//     const onIndex = cleanedMessage.indexOf('\nOn');
-//     if (onIndex !== -1) {
-//       cleanedMessage = cleanedMessage.substring(0, onIndex).trim();
-//     }
-
-//     cleanedMessage = cleanedMessage
-//       .replace(/\\u003C/g, '<')
-//       .replace(/\\u003E/g, '>')
-//       .trim();
-
-//     res.json({
-//       success: true,
-//       data: {
-//         id: reply.id,
-//         batch_id: reply.batch_id,
-//         from_email: reply.from_email,
-//         to_email: reply.to_email,
-//         subject: cleanedSubject,
-//         message: cleanedMessage,
-//         product_name: reply.product_name,
-//         reply_date: reply.reply_date,
-//         company_name: reply.company_name,
-//         contact_name: reply.contact_name,
-//         country: reply.country,
-//         status: reply.status,
-//         template_used: reply.template_used,
-//         response: reply.response,
-//         responded_at: reply.responded_at
-//       }
-//     });
-
-//   } catch (error) {
-//     console.error("Error fetching email reply:", error);
-//     res.status(500).json({ success: false, message: "Error fetching email reply", error: error.message });
-//   }
-// });
-
-
 app.get('/api/tracking/counts', async (req, res) => {
   const { seller_id } = req.query;
 
   if (!seller_id) {
-    return res.status(400).json({ success: false, error: 'seller_id is required' });
+    return res.status(400).json({
+      success: false,
+      error: "seller_id is required"
+    });
   }
 
   try {
-    // 1. SENT count - unique companies that have at least one sent email
-    const [sentCount] = await pool.query(`
-      SELECT COUNT(DISTINCT buyer_id) as count
-      FROM email_history_companies
-      WHERE status = 'sent'
-        AND buyer_id IS NOT NULL
-        AND seller_id = ?
-    `, [seller_id]);
+    const [results] = await pool.query(`
+      SELECT 
+        (SELECT COUNT(DISTINCT buyer_id) FROM email_history_companies 
+         WHERE seller_id = ? AND status = 'sent') AS sent,
+        
+        (SELECT COUNT(DISTINCT buyer_id) FROM email_history_companies 
+         WHERE seller_id = ? AND message IS NOT NULL AND message <> '' AND reply_date IS NOT NULL) AS replied,
+        
+        (SELECT COUNT(DISTINCT buyer_id) FROM email_history_companies 
+         WHERE seller_id = ? AND response = 'interested') AS interested,
+        
+        (SELECT COUNT(DISTINCT buyer_id) FROM email_history_companies 
+         WHERE seller_id = ? AND response = 'not_interested') AS not_interested,
+        
+        (SELECT COUNT(DISTINCT buyer_id) FROM email_history_companies 
+         WHERE seller_id = ?) AS total_contacted
+    `, [seller_id, seller_id, seller_id, seller_id, seller_id]);
 
-    // 2. REPLIED count - unique companies that have at least one reply
-    const [repliedCount] = await pool.query(`
-      SELECT COUNT(DISTINCT buyer_id) as count
-      FROM email_history_companies
-      WHERE message IS NOT NULL 
-        AND message != ''
-        AND reply_date IS NOT NULL
-        AND buyer_id IS NOT NULL
-        AND seller_id = ?
-    `, [seller_id]);
-
-    // 3. INTERESTED count - unique companies that have at least one 'interested' response
-    const [interestedCount] = await pool.query(`
-      SELECT COUNT(DISTINCT buyer_id) as count
-      FROM email_history_companies
-      WHERE response = 'interested'
-        AND buyer_id IS NOT NULL
-        AND seller_id = ?
-    `, [seller_id]);
-
-    // 4. NOT INTERESTED count - unique companies that have at least one 'not_interested' response
-    const [notInterestedCount] = await pool.query(`
-      SELECT COUNT(DISTINCT buyer_id) as count
-      FROM email_history_companies
-      WHERE response = 'not_interested'
-        AND buyer_id IS NOT NULL
-        AND seller_id = ?
-    `, [seller_id]);
-
-    // 5. NOT CONTACTED count - buyers with no email history FROM THIS SELLER
-    const [notContactedCount] = await pool.query(`
-      SELECT COUNT(*) as count
-      FROM buyers b
-      WHERE NOT EXISTS (
-        SELECT 1 FROM email_history_companies ehc 
-        WHERE ehc.buyer_id = b.id AND ehc.seller_id = ?
-      )
-    `, [seller_id]);
-
-    // 6. Total unique companies contacted (have any email history) by this seller
-    const [totalContacted] = await pool.query(`
-      SELECT COUNT(DISTINCT buyer_id) as count
-      FROM email_history_companies
-      WHERE buyer_id IS NOT NULL
-        AND seller_id = ?
-    `, [seller_id]);
+    const data = results[0] || {};
 
     res.json({
       success: true,
       data: {
-        sent: sentCount[0].count,
-        replied: repliedCount[0].count,
-        interested: interestedCount[0].count,
-        not_interested: notInterestedCount[0].count,
-        not_contacted: notContactedCount[0].count
+        sent: data.sent || 0,
+        replied: data.replied || 0,
+        interested: data.interested || 0,
+        not_interested: data.not_interested || 0
       },
       total: {
-        all: totalContacted[0].count + notContactedCount[0].count
+        all: data.total_contacted || 0
       }
     });
 
   } catch (err) {
-    console.error('GET /api/tracking/counts error:', err);
-    res.status(500).json({ success: false, error: err.message });
+    console.error(err);
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
   }
 });
 
-app.get('/api/tracking/all', async (req, res) => {
-  const { seller_id } = req.query;
+// ==================== TRACKING ALL API WITH PAGINATION ====================
+app.get('/api/tracking/page', async (req, res) => {
+  const { seller_id, page = 1, limit = 10 } = req.query;
 
   if (!seller_id) {
-    return res.status(400).json({ success: false, error: 'seller_id is required' });
+    return res.status(400).json({
+      success: false,
+      error: "seller_id is required"
+    });
   }
 
   try {
-    // 1. SENT - Group by buyer_id with interaction count
-    const [sentEmails] = await pool.query(`
-      SELECT 
-        buyer_id,
-        MAX(company_name) as company_name,
-        MAX(country) as country,
-        MAX(contact_name) as contact_name,
-        MAX(email) as email,
-        MAX(template_used) as template_used,
-        MAX(product_name) as product_name,
-        COUNT(*) as interaction_count,
-        MAX(sent_at) as last_interaction,
-        'sent' as type,
-        'sent' as current_status
-      FROM email_history_companies
-      WHERE status = 'sent'
-        AND seller_id = ?
-      GROUP BY buyer_id
-      ORDER BY last_interaction DESC
-    `, [seller_id]);
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const offset = (pageNum - 1) * limitNum;
 
-    // 2. REPLIED - Group by buyer_id with interaction count
-    const [repliedEmails] = await pool.query(`
-      SELECT 
-        buyer_id,
-        MAX(company_name) as company_name,
-        MAX(country) as country,
-        MAX(contact_name) as contact_name,
-        MAX(email) as email,
-        MAX(product_name) as product_name,
-        COUNT(*) as interaction_count,
-        MAX(reply_date) as last_interaction,
-        'replied' as type,
-        'replied' as current_status
-      FROM email_history_companies
-      WHERE message IS NOT NULL 
-        AND message != ''
-        AND reply_date IS NOT NULL
-        AND seller_id = ?
-      GROUP BY buyer_id
-      ORDER BY last_interaction DESC
-    `, [seller_id]);
-
-    // 3. INTERESTED - Group by buyer_id with interaction count
-    const [interestedEmails] = await pool.query(`
-      SELECT 
-        buyer_id,
-        MAX(company_name) as company_name,
-        MAX(country) as country,
-        MAX(contact_name) as contact_name,
-        MAX(email) as email,
-        MAX(product_name) as product_name,
-        COUNT(*) as interaction_count,
-        MAX(responded_at) as last_interaction,
-        'interested' as type,
-        'interested' as current_status
-      FROM email_history_companies
-      WHERE response = 'interested'
-        AND seller_id = ?
-      GROUP BY buyer_id
-      ORDER BY last_interaction DESC
-    `, [seller_id]);
-
-    // 4. NOT INTERESTED - Group by buyer_id with interaction count
-    const [notInterestedEmails] = await pool.query(`
-      SELECT 
-        buyer_id,
-        MAX(company_name) as company_name,
-        MAX(country) as country,
-        MAX(contact_name) as contact_name,
-        MAX(email) as email,
-        MAX(product_name) as product_name,
-        COUNT(*) as interaction_count,
-        MAX(responded_at) as last_interaction,
-        'not_interested' as type,
-        'not_interested' as current_status
-      FROM email_history_companies
-      WHERE response = 'not_interested'
-        AND seller_id = ?
-      GROUP BY buyer_id
-      ORDER BY last_interaction DESC
-    `, [seller_id]);
-
-    // 5. NOT CONTACTED - Buyers with no email history FROM THIS SELLER
-    const [notContacted] = await pool.query(`
-      SELECT DISTINCT
-        b.id as buyer_id,
-        b.company_name,
-        b.country,
-        b.product as product_name,
-        b.hsn_code,
-        GROUP_CONCAT(DISTINCT be.email SEPARATOR ', ') as email,
-        GROUP_CONCAT(DISTINCT bc.contact_number SEPARATOR ', ') as contact_name,
-        0 as interaction_count,
-        NULL as last_interaction,
-        'not_contacted' as type,
-        'not_contacted' as current_status
-      FROM buyers b
-      LEFT JOIN buyer_emails be ON b.id = be.buyer_id
-      LEFT JOIN buyer_contacts bc ON b.id = bc.buyer_id
-      WHERE NOT EXISTS (
-        SELECT 1 FROM email_history_companies ehc 
-        WHERE ehc.buyer_id = b.id AND ehc.seller_id = ?
-      )
-      GROUP BY b.id
-      ORDER BY b.company_name
-    `, [seller_id]);
-
-    // Get detailed counts (total interactions per status, not unique buyers)
-    const [detailedCounts] = await pool.query(`
-      SELECT 
-        SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END) as total_sent,
-        SUM(CASE WHEN message IS NOT NULL AND message != '' AND reply_date IS NOT NULL THEN 1 ELSE 0 END) as total_replied,
-        SUM(CASE WHEN response = 'interested' THEN 1 ELSE 0 END) as total_interested,
-        SUM(CASE WHEN response = 'not_interested' THEN 1 ELSE 0 END) as total_not_interested
+    // Get total count of ALL individual email records
+    const [[totalResult]] = await pool.query(`
+      SELECT COUNT(*) AS total
       FROM email_history_companies
       WHERE seller_id = ?
     `, [seller_id]);
 
-    // Get unique buyer counts
-    const [uniqueBuyerCounts] = await pool.query(`
-      SELECT 
-        COUNT(DISTINCT CASE WHEN status = 'sent' THEN buyer_id END) as unique_sent_buyers,
-        COUNT(DISTINCT CASE WHEN message IS NOT NULL AND message != '' AND reply_date IS NOT NULL THEN buyer_id END) as unique_replied_buyers,
-        COUNT(DISTINCT CASE WHEN response = 'interested' THEN buyer_id END) as unique_interested_buyers,
-        COUNT(DISTINCT CASE WHEN response = 'not_interested' THEN buyer_id END) as unique_not_interested_buyers
+    const totalContacted = totalResult.total || 0;
+
+    // Get paginated data - EACH INDIVIDUAL EMAIL (NO GROUP BY)
+    const [allData] = await pool.query(`
+      SELECT
+        id,
+        buyer_id,
+        company_name,
+        country,
+        contact_name,
+        email,
+        product_name,
+        sent_at,
+        reply_date,
+        responded_at,
+        response,
+        status,
+        template_used,
+        subject,
+        message,
+        CASE
+          WHEN response = 'interested' THEN 'interested'
+          WHEN response = 'not_interested' THEN 'not_interested'
+          WHEN reply_date IS NOT NULL AND response IS NULL THEN 'replied'
+          WHEN status = 'sent' AND response IS NULL AND reply_date IS NULL THEN 'sent'
+          ELSE 'sent'
+        END AS current_status,
+        COALESCE(responded_at, reply_date, sent_at) AS last_interaction
       FROM email_history_companies
       WHERE seller_id = ?
-    `, [seller_id]);
+      ORDER BY sent_at DESC
+      LIMIT ? OFFSET ?
+    `, [seller_id, limitNum, offset]);
 
-    // Get not contacted count
-    const [notContactedCount] = await pool.query(`
-      SELECT COUNT(DISTINCT b.id) as count
-      FROM buyers b
-      WHERE NOT EXISTS (
-        SELECT 1 FROM email_history_companies ehc 
-        WHERE ehc.buyer_id = b.id AND ehc.seller_id = ?
-      )
+    // Categorize by individual email status
+    const sent = allData.filter(item => item.current_status === 'sent');
+    const replied = allData.filter(item => item.current_status === 'replied');
+    const interested = allData.filter(item => item.current_status === 'interested');
+    const not_interested = allData.filter(item => item.current_status === 'not_interested');
+
+    // Get counts for each status (counting individual emails)
+    const [[countsResult]] = await pool.query(`
+      SELECT
+        SUM(CASE 
+          WHEN response = 'interested' THEN 1 
+          WHEN response = 'not_interested' THEN 1 
+          WHEN reply_date IS NOT NULL AND response IS NULL THEN 1 
+          WHEN status = 'sent' AND response IS NULL AND reply_date IS NULL THEN 1 
+          ELSE 0 
+        END) AS total_emails,
+        SUM(CASE WHEN response = 'interested' THEN 1 ELSE 0 END) AS interested_count,
+        SUM(CASE WHEN response = 'not_interested' THEN 1 ELSE 0 END) AS not_interested_count,
+        SUM(CASE WHEN reply_date IS NOT NULL AND response IS NULL THEN 1 ELSE 0 END) AS replied_count,
+        SUM(CASE WHEN status = 'sent' AND response IS NULL AND reply_date IS NULL THEN 1 ELSE 0 END) AS sent_count
+      FROM email_history_companies
+      WHERE seller_id = ?
     `, [seller_id]);
 
     res.json({
       success: true,
       data: {
-        sent: sentEmails,
-        replied: repliedEmails,
-        interested: interestedEmails,
-        not_interested: notInterestedEmails,
-        notContacted: notContacted
+        sent,
+        replied,
+        interested,
+        not_interested
+      },
+      pagination: {
+        currentPage: pageNum,
+        totalPages: Math.ceil(totalContacted / limitNum),
+        totalItems: totalContacted,
+        itemsPerPage: limitNum
       },
       counts: {
-        totalSent: detailedCounts[0]?.total_sent || 0,
-        totalReplied: detailedCounts[0]?.total_replied || 0,
-        totalInterested: detailedCounts[0]?.total_interested || 0,
-        totalNotInterested: detailedCounts[0]?.total_not_interested || 0,
-        totalNotContacted: notContactedCount[0]?.count || 0,
-        
-        uniqueBuyers: {
-          sent: uniqueBuyerCounts[0]?.unique_sent_buyers || 0,
-          replied: uniqueBuyerCounts[0]?.unique_replied_buyers || 0,
-          interested: uniqueBuyerCounts[0]?.unique_interested_buyers || 0,
-          not_interested: uniqueBuyerCounts[0]?.unique_not_interested_buyers || 0,
-          not_contacted: notContactedCount[0]?.count || 0
-        }
+        sent: countsResult.sent_count || 0,
+        replied: countsResult.replied_count || 0,
+        interested: countsResult.interested_count || 0,
+        not_interested: countsResult.not_interested_count || 0
       }
     });
 
   } catch (err) {
-    console.error('GET /api/tracking/all error:', err);
-    res.status(500).json({ error: err.message });
+    console.error("GET /api/tracking/all:", err);
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
   }
 });
+
+
 
 app.get('/api/tracking/buyer/:id', async (req, res) => {
   const buyerId = req.params.id;
-  const sellerId = req.query.sellerId; // Get sellerId from query params
+  const sellerId = req.query.sellerId;
   
   try {
     // Validate sellerId
@@ -2000,28 +2494,28 @@ app.get('/api/tracking/buyer/:id', async (req, res) => {
           .trim();
       }
       
-      // Determine display status
+      // Determine display status based on actual data
       let display_status = 'Unknown';
       if (comm.response === 'interested') {
         display_status = 'Interested';
       } else if (comm.response === 'not_interested') {
         display_status = 'Not Interested';
-      } else if (comm.message && comm.message.trim() !== '' && comm.reply_date) {
+      } else if (comm.reply_date && comm.reply_date !== null) {
         display_status = 'Replied';
-      } else if (comm.status === 'sent') {
+      } else if (comm.status === 'sent' || comm.status === 'Manual Entry') {
         display_status = 'Sent';
       }
       
       return {
         ...comm,
-        subject: cleanedSubject,
-        message: cleanedMessage,
+        subject: cleanedSubject || 'No Subject',
+        message: cleanedMessage || 'No message content',
         display_status,
-        date: comm.sent_at || comm.reply_date || comm.responded_at
+        date: comm.sent_at || comm.reply_date || comm.responded_at || comm.sent_at
       };
     });
 
-    // 4. Calculate summary statistics (only for this seller's communications)
+    // 4. Calculate summary statistics
     const summary = {
       total: processedCommunications.length,
       sent: processedCommunications.filter(c => c.display_status === 'Sent').length,
@@ -2043,7 +2537,7 @@ app.get('/api/tracking/buyer/:id', async (req, res) => {
         email: buyerInfo.emails?.split(',')[0]?.trim() || 'N/A',
         all_emails: buyerInfo.emails,
         all_contacts: buyerInfo.contacts,
-        seller_id: sellerId // Add current seller_id
+        seller_id: sellerId
       },
       summary: summary
     });
@@ -2053,6 +2547,380 @@ app.get('/api/tracking/buyer/:id', async (req, res) => {
     res.status(500).json({ 
       success: false, 
       error: err.message 
+    });
+  }
+});
+
+
+// GET /api/tracking/buyer/:buyerId - Get buyer communications with pagination
+app.get('/api/tracking/buyer/:buyerId', async (req, res) => {
+  const { buyerId } = req.params;
+  const { sellerId, page = 1, limit = 10 } = req.query;
+
+  if (!buyerId) {
+    return res.status(400).json({
+      success: false,
+      message: 'buyerId is required'
+    });
+  }
+
+  if (!sellerId) {
+    return res.status(400).json({
+      success: false,
+      message: 'sellerId is required'
+    });
+  }
+
+  try {
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const offset = (pageNum - 1) * limitNum;
+
+    // 1. Get buyer info
+    const [buyerInfo] = await pool.query(`
+      SELECT 
+        b.id as buyer_id,
+        b.company_name,
+        b.country,
+        b.product as product_name,
+        GROUP_CONCAT(DISTINCT bc.contact_number SEPARATOR ', ') as contacts,
+        GROUP_CONCAT(DISTINCT be.email SEPARATOR ', ') as emails,
+        b.buyer_date
+      FROM buyers b
+      LEFT JOIN buyer_contacts bc ON b.id = bc.buyer_id
+      LEFT JOIN buyer_emails be ON b.id = be.buyer_id
+      WHERE b.id = ?
+      GROUP BY b.id
+    `, [buyerId]);
+
+    if (buyerInfo.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Buyer not found'
+      });
+    }
+
+    const buyer = buyerInfo[0];
+
+    // 2. Get total count of communications for this buyer
+    const [countResult] = await pool.query(`
+      SELECT COUNT(*) as total
+      FROM email_history_companies
+      WHERE buyer_id = ? AND seller_id = ?
+    `, [buyerId, sellerId]);
+
+    const total = countResult[0]?.total || 0;
+
+    // 3. Get paginated communications
+    const [communications] = await pool.query(`
+      SELECT 
+        id,
+        buyer_id,
+        batch_id,
+        company_name,
+        country,
+        contact_name,
+        email as from_email,
+        to_email,
+        subject,
+        message,
+        product_name,
+        sent_at,
+        reply_date,
+        responded_at,
+        status,
+        template_used,
+        response,
+        seller_id,
+        'email' as record_type
+      FROM email_history_companies
+      WHERE buyer_id = ? AND seller_id = ?
+      ORDER BY COALESCE(sent_at, reply_date, responded_at) DESC
+      LIMIT ? OFFSET ?
+    `, [buyerId, sellerId, limitNum, offset]);
+
+    // 4. Process communications
+    const processedCommunications = communications.map(comm => {
+      let cleanedSubject = comm.subject || '';
+      let cleanedMessage = comm.message || '';
+      
+      cleanedSubject = cleanedSubject.replace(/\s*\[BATCH:[^\]]+\]/g, '');
+      cleanedSubject = cleanedSubject.replace(/^Re:\s*/i, '');
+      
+      if (cleanedMessage) {
+        const onIndex = cleanedMessage.indexOf('\nOn ');
+        if (onIndex !== -1) {
+          cleanedMessage = cleanedMessage.substring(0, onIndex).trim();
+        }
+        const wroteIndex = cleanedMessage.indexOf('wrote:');
+        if (wroteIndex !== -1) {
+          cleanedMessage = cleanedMessage.substring(0, wroteIndex).trim();
+        }
+        cleanedMessage = cleanedMessage
+          .replace(/\\u003C/g, '<')
+          .replace(/\\u003E/g, '>')
+          .replace(/\[[^\]]*\]/g, '')
+          .replace(/https?:\/\/[^\s]+/g, '')
+          .replace(/\n\s*\n\s*\n/g, '\n\n')
+          .trim();
+      }
+      
+      let display_status = 'Unknown';
+      if (comm.response === 'interested') {
+        display_status = 'Interested';
+      } else if (comm.response === 'not_interested') {
+        display_status = 'Not Interested';
+      } else if (comm.message && comm.message.trim() !== '' && comm.reply_date) {
+        display_status = 'Replied';
+      } else if (comm.status === 'sent') {
+        display_status = 'Sent';
+      }
+      
+      return {
+        ...comm,
+        subject: cleanedSubject,
+        message: cleanedMessage,
+        display_status,
+        date: comm.sent_at || comm.reply_date || comm.responded_at
+      };
+    });
+
+    // 5. Calculate summary
+    const summary = {
+      total: processedCommunications.length,
+      sent: processedCommunications.filter(c => c.display_status === 'Sent').length,
+      replied: processedCommunications.filter(c => c.display_status === 'Replied').length,
+      interested: processedCommunications.filter(c => c.display_status === 'Interested').length,
+      not_interested: processedCommunications.filter(c => c.display_status === 'Not Interested').length,
+      last_activity: processedCommunications[0]?.date || null
+    };
+
+    res.json({
+      success: true,
+      data: processedCommunications,
+      buyer_info: {
+        buyer_id: buyer.buyer_id,
+        company_name: buyer.company_name,
+        country: buyer.country,
+        product_name: buyer.product_name,
+        contact_name: buyer.contacts?.split(',')[0]?.trim() || 'N/A',
+        email: buyer.emails?.split(',')[0]?.trim() || 'N/A',
+        all_emails: buyer.emails,
+        all_contacts: buyer.contacts
+      },
+      summary: summary,
+      pagination: {
+        total: total,
+        page: pageNum,
+        limit: limitNum,
+        totalPages: Math.ceil(total / limitNum)
+      }
+    });
+
+  } catch (err) {
+    console.error('GET /api/tracking/buyer/:buyerId error:', err);
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
+  }
+});
+
+// ==================== SEARCH BUYER COMMUNICATIONS (WITH PAGINATION) ====================
+app.get('/api/tracking/buyer/:buyerId/search', async (req, res) => {
+  const { buyerId } = req.params;
+  const { sellerId, search = '', page = 1, limit = 10 } = req.query;
+
+  if (!buyerId) {
+    return res.status(400).json({
+      success: false,
+      message: 'buyerId is required'
+    });
+  }
+
+  if (!sellerId) {
+    return res.status(400).json({
+      success: false,
+      message: 'sellerId is required'
+    });
+  }
+
+  try {
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const offset = (pageNum - 1) * limitNum;
+
+    // Build search conditions - using actual database columns
+    let whereConditions = ['buyer_id = ?', 'seller_id = ?'];
+    let params = [buyerId, sellerId];
+
+    if (search && search.trim() !== '') {
+      const searchPattern = `%${search}%`;
+      whereConditions.push(`(
+        subject LIKE ? OR 
+        message LIKE ? OR 
+        response LIKE ? OR 
+        template_used LIKE ? OR 
+        company_name LIKE ? OR
+        to_email LIKE ? OR
+        contact_name LIKE ?
+      )`);
+      params.push(
+        searchPattern, 
+        searchPattern, 
+        searchPattern, 
+        searchPattern, 
+        searchPattern, 
+        searchPattern,
+        searchPattern
+      );
+    }
+
+    const whereClause = `WHERE ${whereConditions.join(' AND ')}`;
+
+    // Get total count with search
+    const countQuery = `
+      SELECT COUNT(*) as total
+      FROM email_history_companies
+      ${whereClause}
+    `;
+    const [countResult] = await pool.query(countQuery, params);
+    const total = countResult[0]?.total || 0;
+
+    // Get paginated search results
+    const query = `
+      SELECT 
+        id,
+        buyer_id,
+        batch_id,
+        company_name,
+        country,
+        contact_name,
+        email as from_email,
+        to_email,
+        subject,
+        message,
+        product_name,
+        sent_at,
+        reply_date,
+        responded_at,
+        status,
+        template_used,
+        response,
+        seller_id,
+        'email' as record_type,
+        COALESCE(sent_at, reply_date, responded_at) as date
+      FROM email_history_companies
+      ${whereClause}
+      ORDER BY COALESCE(sent_at, reply_date, responded_at) DESC
+      LIMIT ? OFFSET ?
+    `;
+
+    const queryParams = [...params, limitNum, offset];
+    const [communications] = await pool.query(query, queryParams);
+
+    // Process communications and add display_status
+    const processedCommunications = communications.map(comm => {
+      let cleanedSubject = comm.subject || '';
+      let cleanedMessage = comm.message || '';
+      
+      cleanedSubject = cleanedSubject.replace(/\s*\[BATCH:[^\]]+\]/g, '');
+      cleanedSubject = cleanedSubject.replace(/^Re:\s*/i, '');
+      
+      if (cleanedMessage) {
+        const onIndex = cleanedMessage.indexOf('\nOn ');
+        if (onIndex !== -1) {
+          cleanedMessage = cleanedMessage.substring(0, onIndex).trim();
+        }
+        const wroteIndex = cleanedMessage.indexOf('wrote:');
+        if (wroteIndex !== -1) {
+          cleanedMessage = cleanedMessage.substring(0, wroteIndex).trim();
+        }
+        cleanedMessage = cleanedMessage
+          .replace(/\\u003C/g, '<')
+          .replace(/\\u003E/g, '>')
+          .replace(/\[[^\]]*\]/g, '')
+          .replace(/https?:\/\/[^\s]+/g, '')
+          .replace(/\n\s*\n\s*\n/g, '\n\n')
+          .trim();
+      }
+      
+      let display_status = 'Unknown';
+      if (comm.response === 'interested') {
+        display_status = 'Interested';
+      } else if (comm.response === 'not_interested') {
+        display_status = 'Not Interested';
+      } else if (comm.message && comm.message.trim() !== '' && comm.reply_date) {
+        display_status = 'Replied';
+      } else if (comm.status === 'sent') {
+        display_status = 'Sent';
+      }
+      
+      return {
+        ...comm,
+        subject: cleanedSubject,
+        message: cleanedMessage,
+        display_status,
+        date: comm.sent_at || comm.reply_date || comm.responded_at
+      };
+    });
+
+    // Calculate summary
+    const summary = {
+      total: processedCommunications.length,
+      sent: processedCommunications.filter(c => c.display_status === 'Sent').length,
+      replied: processedCommunications.filter(c => c.display_status === 'Replied').length,
+      interested: processedCommunications.filter(c => c.display_status === 'Interested').length,
+      not_interested: processedCommunications.filter(c => c.display_status === 'Not Interested').length,
+      last_activity: processedCommunications[0]?.date || null
+    };
+
+    // Get buyer info
+    const [buyerInfo] = await pool.query(`
+      SELECT 
+        b.id as buyer_id,
+        b.company_name,
+        b.country,
+        b.product as product_name,
+        GROUP_CONCAT(DISTINCT bc.contact_number SEPARATOR ', ') as contacts,
+        GROUP_CONCAT(DISTINCT be.email SEPARATOR ', ') as emails
+      FROM buyers b
+      LEFT JOIN buyer_contacts bc ON b.id = bc.buyer_id
+      LEFT JOIN buyer_emails be ON b.id = be.buyer_id
+      WHERE b.id = ?
+      GROUP BY b.id
+    `, [buyerId]);
+
+    const buyer = buyerInfo[0] || {};
+
+    res.json({
+      success: true,
+      data: processedCommunications,
+      buyer_info: {
+        buyer_id: buyer.buyer_id,
+        company_name: buyer.company_name || 'Unknown',
+        country: buyer.country || 'Unknown',
+        product_name: buyer.product_name || 'Unknown',
+        contact_name: buyer.contacts?.split(',')[0]?.trim() || 'N/A',
+        email: buyer.emails?.split(',')[0]?.trim() || 'N/A',
+        all_emails: buyer.emails || '',
+        all_contacts: buyer.contacts || ''
+      },
+      summary: summary,
+      pagination: {
+        total: total,
+        page: pageNum,
+        limit: limitNum,
+        totalPages: Math.ceil(total / limitNum)
+      },
+      search: search || null
+    });
+
+  } catch (err) {
+    console.error('GET /api/tracking/buyer/:buyerId/search error:', err);
+    res.status(500).json({
+      success: false,
+      error: err.message
     });
   }
 });
@@ -2287,7 +3155,15 @@ app.post("/api/seller/login", async (req, res) => {
 });
 app.post("/api/store-user", async (req, res) => {
   try {
-    const { id, email, password, role } = req.body;
+const {
+  id,
+  email,
+  password,
+  role,
+  name,
+  phone,
+  package_id
+} = req.body;
 
     if (!id || !email || !password) {
       return res.status(400).json({
@@ -2314,27 +3190,43 @@ app.post("/api/store-user", async (req, res) => {
     }
 
     // User doesn't exist, insert new record
-    const [result] = await pool.execute(
-      `INSERT INTO users
-      (id, email, password, role, email_sent, email_config)
-      VALUES (?, ?, ?, ?, 0, 0)`,
-      [
-        id,
-        email,
-        password,
-        role || "seller"
-      ]
-    );
+   const [result] = await pool.execute(
+  `INSERT INTO users
+  (
+    id,
+    email,
+    password,
+    role,
+    name,
+    phone_number,
+    package_id,
+    email_sent,
+    email_config
+  )
+  VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0)`,
+  [
+    id,
+    email,
+    password,
+    role || "seller",
+    name,
+    phone,
+    package_id
+  ]
+);
 
     res.status(201).json({
-      success: true,
-      exists: false,
-      message: "User stored successfully",
-      user_id: result.insertId,
-      id: id,
-      email: email,
-      role: role || "seller"
-    });
+  success: true,
+  exists: false,
+  message: "User stored successfully",
+  user_id: result.insertId,
+  id,
+  email,
+  role,
+  name,
+  phone,
+  package_id
+});
 
   } catch (err) {
     console.error('Error in /api/store-user:', err);
@@ -2662,16 +3554,17 @@ app.get("/status/:userId", async (req, res) => {
 app.use('/', buyerRoutes);
 app.use('/', bulkBuyerRoutes);
 app.use('/', userRoutes);
+// app.use('/', ssoRouter);
 /* ─────────────────────────────────────────────
    START SERVER
 ───────────────────────────────────────────── */
 console.log('📧 Starting email reply monitor...');
 
-// checkForReplies();
+checkForReplies();
 
-// setInterval(() => {
-//   checkForReplies();
-// }, 2 * 60 * 1000);
+setInterval(() => {
+  checkForReplies();
+}, 2 * 60 * 1000);
 
 app.listen(5000, () => {
   console.log(`Server running on port 5000`);

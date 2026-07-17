@@ -8,7 +8,7 @@ const pool = mysql.createPool({
   // database: "buyer-seller",
   waitForConnections: true,
   connectionLimit: 10,
-  port:4306
+  // port:4306
 });
 
 module.exports = pool;

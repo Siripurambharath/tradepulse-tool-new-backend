@@ -4,7 +4,21 @@ const multer = require("multer");
 const XLSX = require("xlsx");
 const path = require("path");
 const fs = require("fs");
-let pool;
+
+/* ===============================
+   MIDDLEWARE TO ATTACH POOL TO REQUEST
+================================ */
+router.use((req, res, next) => {
+  req.pool = req.app.get('pool');
+  if (!req.pool) {
+    return res.status(500).json({
+      success: false,
+      message: "Database connection not available"
+    });
+  }
+  next();
+});
+
 /* ===============================
    PATH CONFIG
 ================================ */
@@ -229,13 +243,12 @@ const checkDuplicate = async (connection, product, company_name, newContactNumbe
   }
 };
 
-/* ===============================
-   BULK UPLOAD BUYERS
-================================ */
 router.post(
   "/api/buyers/bulk-upload",
   uploadExcel.single("excelFile"),
   async (req, res) => {
+    const pool = req.pool;
+    
     let connection;
     let duplicateEntries = [];
     let insertedCount = 0;
@@ -263,10 +276,23 @@ router.post(
         });
       }
 
+      // Check for 9 required columns
       const headers = Object.keys(rows[0]);
-      const schemaValidation = validateSchema(headers);
+      const requiredColumns = [
+        'product',
+        'hsn_code',
+        'country',
+        'company_name',
+        'website',
+        'buyer_date',
+        'address',
+        'contact_numbers',
+        'emails'
+      ];
       
-      if (!schemaValidation.isValid) {
+      const missingColumns = requiredColumns.filter(col => !headers.includes(col));
+      
+      if (missingColumns.length > 0) {
         if (req.file && req.file.path && fs.existsSync(req.file.path)) {
           fs.unlinkSync(req.file.path);
         }
@@ -274,14 +300,14 @@ router.post(
         return res.status(400).json({
           success: false,
           schemaMismatch: true,
-          message: "Schema mismatch detected. Please download the template and use the exact column headers.",
-          missingColumns: schemaValidation.missingColumns,
-          extraColumns: schemaValidation.extraColumns
+          message: "Missing required columns. Please add these columns to your Excel file.",
+          missingColumns: missingColumns,
+          extraColumns: headers.filter(col => !requiredColumns.includes(col))
         });
       }
 
       for (const row of rows) {
-        const additional_details = String(row.additional_details || row.details || "").trim();
+        // Extract fields (9 are required, others optional)
         const product = String(row.product || "").trim();
         const hsn_code = String(row.hsn_code || "").trim();
         const country = String(row.country || "").trim();
@@ -289,27 +315,41 @@ router.post(
         const website = String(row.website || "").trim();
         const buyer_date = row.buyer_date || null;
         const address = String(row.address || "").trim();
-        const suggested_keywords = String(row.suggested_keywords || "").trim();
-        const hsn_descriptions = String(row.hsn_descriptions || "").trim();
+        
+        // Optional fields (can be empty)
+        const additional_details = String(row.additional_details || row.details || "").trim() || null;
+        const suggested_keywords = String(row.suggested_keywords || "").trim() || null;
+        const hsn_descriptions = String(row.hsn_descriptions || "").trim() || null;
         const confidence_level = String(row.confidence_level || "Medium").trim();
-        const reason = String(row.reason || "").trim();
-        const classification_notes = String(row.classification_notes || "").trim();
+        const reason = String(row.reason || "").trim() || null;
+        const classification_notes = String(row.classification_notes || "").trim() || null;
         const manual_verification = String(row.manual_verification || "Pending").trim();
 
         const contactNumbers = String(row.contact_numbers || "").trim()
           .split(",")
           .map(c => c.trim())
           .filter(c => c.length > 0)
-          .sort(); // Sort for consistent comparison
+          .sort();
 
         const emails = String(row.emails || "").trim()
           .split(",")
           .map(e => e.trim())
           .filter(e => e.length > 0)
-          .sort(); // Sort for consistent comparison
+          .sort();
 
-        if (!product || !company_name) {
-          console.warn("⚠️ Skipping row: Missing product or company_name");
+        // Validate ALL 9 required fields
+        if (
+          !product ||
+          !hsn_code ||
+          !country ||
+          !company_name ||
+          !website ||
+          !buyer_date ||
+          !address ||
+          !contactNumbers.length ||
+          !emails.length
+        ) {
+          console.warn("⚠️ Skipping row: Missing one or more required fields");
           skippedCount++;
           continue;
         }
@@ -349,18 +389,18 @@ router.post(
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             product,
-            hsn_code || null,
-            country || null,
+            hsn_code,
+            country,
             company_name,
-            website || null,
-            buyer_date || null,
-            address || null,
-            additional_details || null,
-            suggested_keywords || null,
-            hsn_descriptions || null,
+            website,
+            buyer_date,
+            address,
+            additional_details,          // Can be null
+            suggested_keywords,          // Can be null
+            hsn_descriptions,            // Can be null
             confidence_level,
-            reason || null,
-            classification_notes || null,
+            reason,                      // Can be null
+            classification_notes,        // Can be null
             manual_verification,
           ]
         );
@@ -445,6 +485,8 @@ router.post(
    GET ALL BUYERS (with contacts and emails)
 ================================ */
 router.get("/api/buyers/bulk/all", async (req, res) => {
+  const pool = req.pool;
+  
   try {
     const [buyers] = await pool.query(`
       SELECT 
@@ -481,6 +523,8 @@ router.get("/api/buyers/bulk/all", async (req, res) => {
    GET SINGLE BUYER
 ================================ */
 router.get("/api/buyers/bulk/:id", async (req, res) => {
+  const pool = req.pool;
+  
   try {
     const { id } = req.params;
 
@@ -529,6 +573,8 @@ router.get("/api/buyers/bulk/:id", async (req, res) => {
    UPDATE BUYER
 ================================ */
 router.put("/api/buyers/bulk/:id", async (req, res) => {
+  const pool = req.pool;
+  
   let connection;
   
   try {
@@ -654,6 +700,8 @@ router.put("/api/buyers/bulk/:id", async (req, res) => {
    DELETE BUYER
 ================================ */
 router.delete("/api/buyers/bulk/:id", async (req, res) => {
+  const pool = req.pool;
+  
   let connection;
   
   try {
