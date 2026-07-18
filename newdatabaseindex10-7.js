@@ -42,7 +42,7 @@ const pool = mysql.createPool({
   host: "localhost",
   user: "root",
   password: "",
-  database: "seller_buyer_dummy_old",
+  database: "seller_buyer_dummy",
   waitForConnections: true,
   connectionLimit: 20,
 });
@@ -3543,6 +3543,67 @@ app.get("/status/:userId", async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Server Error"
+    });
+  }
+});
+
+
+app.get('/api/package/:packageId', async (req, res) => {
+  try {
+    const { packageId } = req.params;
+    
+    if (!packageId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Package ID is required'
+      });
+    }
+
+    // Query to get package name from tbl_package_membership
+    const query = 'SELECT id, package_name FROM tbl_package_membership WHERE id = ?';
+    
+    remotePool.getConnection((err, connection) => {
+      if (err) {
+        console.error('Error getting remote connection:', err);
+        return res.status(500).json({
+          success: false,
+          message: 'Database connection error'
+        });
+      }
+
+      connection.query(query, [packageId], (error, results) => {
+        connection.release(); // Always release the connection
+
+        if (error) {
+          console.error('Error fetching package:', error);
+          return res.status(500).json({
+            success: false,
+            message: 'Error fetching package data'
+          });
+        }
+
+        if (results.length === 0) {
+          return res.status(404).json({
+            success: false,
+            message: 'Package not found'
+          });
+        }
+
+        return res.status(200).json({
+          success: true,
+          data: {
+            id: results[0].id,
+            package_name: results[0].package_name
+          }
+        });
+      });
+    });
+
+  } catch (error) {
+    console.error('Error in package API:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Internal server error'
     });
   }
 });
