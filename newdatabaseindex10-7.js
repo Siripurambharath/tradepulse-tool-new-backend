@@ -3548,66 +3548,34 @@ app.get("/status/:userId", async (req, res) => {
 });
 
 
-app.get('/api/package/:packageId', async (req, res) => {
+app.get("/api/package/:packageId", async (req, res) => {
   try {
     const { packageId } = req.params;
-    
-    if (!packageId) {
-      return res.status(400).json({
+
+    const [rows] = await remotePool.execute(
+      "SELECT id, package_name FROM tbl_package_membership WHERE id = ?",
+      [packageId]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({
         success: false,
-        message: 'Package ID is required'
+        message: "Package not found",
       });
     }
 
-    // Query to get package name from tbl_package_membership
-    const query = 'SELECT id, package_name FROM tbl_package_membership WHERE id = ?';
-    
-    remotePool.getConnection((err, connection) => {
-      if (err) {
-        console.error('Error getting remote connection:', err);
-        return res.status(500).json({
-          success: false,
-          message: 'Database connection error'
-        });
-      }
-
-      connection.query(query, [packageId], (error, results) => {
-        connection.release(); // Always release the connection
-
-        if (error) {
-          console.error('Error fetching package:', error);
-          return res.status(500).json({
-            success: false,
-            message: 'Error fetching package data'
-          });
-        }
-
-        if (results.length === 0) {
-          return res.status(404).json({
-            success: false,
-            message: 'Package not found'
-          });
-        }
-
-        return res.status(200).json({
-          success: true,
-          data: {
-            id: results[0].id,
-            package_name: results[0].package_name
-          }
-        });
-      });
+    res.json({
+      success: true,
+      data: rows[0],
     });
-
-  } catch (error) {
-    console.error('Error in package API:', error);
-    return res.status(500).json({
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
       success: false,
-      message: 'Internal server error'
+      message: "Internal server error",
     });
   }
 });
-
 app.use('/', buyerRoutes);
 app.use('/', bulkBuyerRoutes);
 app.use('/', userRoutes);
