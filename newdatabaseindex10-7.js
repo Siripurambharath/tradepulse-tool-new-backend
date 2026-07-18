@@ -42,7 +42,7 @@ const pool = mysql.createPool({
   host: "localhost",
   user: "root",
   password: "",
-  database: "seller_buyer_dummy",
+  database: "seller_buyer_dummy_old",
   waitForConnections: true,
   connectionLimit: 20,
 });
@@ -680,7 +680,7 @@ app.get("/buyers", async (req, res) => {
     console.error(err);
     res.status(500).json({ success: false, error: err.message });
   }
-});
+})
 
 
 
@@ -3574,6 +3574,88 @@ app.get("/api/package/:packageId", async (req, res) => {
       success: false,
       message: "Internal server error",
     });
+  }
+});
+
+app.get("/api/:id/package", async (req, res) => {
+  try {
+    const sellerId = String(req.params.id).trim();
+    console.log("Fetching package info for seller_id:", sellerId);
+
+    // Local: seller's package assignment, expiry, usage
+    const [sellerRows] = await pool.query(
+      `SELECT
+          id,
+          name,
+          package_id,
+          package_expire,
+          phone_used,
+          email_used
+       FROM users
+       WHERE id = ?`,
+      [sellerId]
+    );
+
+    if (sellerRows.length === 0) {
+      return res.status(404).json({ success: false, error: "Seller not found" });
+    }
+
+    const seller = sellerRows[0];
+
+    if (!seller.package_id) {
+      return res.json({
+        success: true,
+        data: {
+          package_id: null,
+          package_name: null,
+          package_expire: seller.package_expire,
+          is_expired: !seller.package_expire || new Date(seller.package_expire) < new Date(),
+          buyer_contact_limit: null,
+          phone_used: seller.phone_used,
+          email_used: seller.email_used,
+          phone_remaining: null,
+          email_remaining: null,
+        },
+      });
+    }
+
+    // Remote: package details + limit
+    const [pkgRows] = await remotePool.query(
+      `SELECT id, package_name, buyer_contact_limit
+       FROM tbl_package_membership
+       WHERE id = ?`,
+      [seller.package_id]
+    );
+
+    if (pkgRows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "PACKAGE_NOT_FOUND",
+        message: "Assigned package not found in remote database.",
+      });
+    }
+
+    const pkg = pkgRows[0];
+    const isUnlimited = pkg.buyer_contact_limit === null;
+    const isExpired = !seller.package_expire || new Date(seller.package_expire) < new Date();
+
+    res.json({
+      success: true,
+      data: {
+        package_id: pkg.id,
+        package_name: pkg.package_name,
+        package_expire: seller.package_expire,
+        is_expired: isExpired,
+        buyer_contact_limit: pkg.buyer_contact_limit,
+        phone_used: seller.phone_used,
+        email_used: seller.email_used,
+        phone_remaining: isUnlimited ? null : Math.max(pkg.buyer_contact_limit - seller.phone_used, 0),
+        email_remaining: isUnlimited ? null : Math.max(pkg.buyer_contact_limit - seller.email_used, 0),
+      },
+    });
+  } catch (err) {
+    console.error("GET /api/:id/package ERROR:", err);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 app.use('/', buyerRoutes);
