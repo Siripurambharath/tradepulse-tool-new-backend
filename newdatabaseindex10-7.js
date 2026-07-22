@@ -42,7 +42,7 @@ const pool = mysql.createPool({
   host: "localhost",
   user: "root",
   password: "",
-  database: "seller_buyer_dummy_old",
+  database: "seller_buyer_dummy",
   waitForConnections: true,
   connectionLimit: 20,
 });
@@ -269,7 +269,7 @@ emailQueue.process(async (job) => {
         [new Date(), sendStatus, company.templateUsed || 'Welcome Template',
          company.templateId, originalProduct, job.data.multipleProducts || false,
          company.buyer_id, sellerId, 
-         contactValue,  // Store contacts in contact_name
+         contactValue,  
          batchId, recipientEmail]
       );
     } else {
@@ -304,6 +304,90 @@ emailQueue.on('failed', (job, err) => {
   console.error(`Job ${job.id} failed — ${job.data.recipientEmail}: ${err.message}`);
 });
 
+
+app.get("/api/:id/package", async (req, res) => {
+  try {
+    const sellerId = String(req.params.id).trim();
+    console.log("Fetching package info for seller_id:", sellerId);
+
+    // Local: seller's package assignment, expiry, usage
+    const [sellerRows] = await pool.query(
+      `SELECT
+          id,
+          name,
+          package_id,
+          package_expire,
+          phone_used,
+          email_used
+       FROM users
+       WHERE id = ?`,
+      [sellerId]
+    );
+
+    if (sellerRows.length === 0) {
+      return res.status(404).json({ success: false, error: "Seller not found" });
+    }
+
+    const seller = sellerRows[0];
+
+    if (!seller.package_id) {
+      return res.json({
+        success: true,
+        data: {
+          package_id: null,
+          package_name: null,
+          package_expire: seller.package_expire,
+          is_expired: !seller.package_expire || new Date(seller.package_expire) < new Date(),
+          buyer_contact_limit: null,
+          phone_used: seller.phone_used,
+          email_used: seller.email_used,
+          phone_remaining: null,
+          email_remaining: null,
+        },
+      });
+    }
+
+    // Remote: package details + limit
+    const [pkgRows] = await remotePool.query(
+      `SELECT id, package_name, buyer_contact_limit
+       FROM tbl_package_membership
+       WHERE id = ?`,
+      [seller.package_id]
+    );
+console.log("id:", pkgRows[0].id);
+console.log("package_name:", pkgRows[0].package_name);
+console.log("buyer_contact_limit:", pkgRows[0].buyer_contact_limit);
+    if (pkgRows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "PACKAGE_NOT_FOUND",
+        message: "Assigned package not found in remote database.",
+      });
+    }
+
+    const pkg = pkgRows[0];
+    const isUnlimited = pkg.buyer_contact_limit === null;
+    const isExpired = !seller.package_expire || new Date(seller.package_expire) < new Date();
+
+    res.json({
+      success: true,
+      data: {
+        package_id: pkg.id,
+        package_name: pkg.package_name,
+        package_expire: seller.package_expire,
+        is_expired: isExpired,
+        buyer_contact_limit: pkg.buyer_contact_limit,
+        phone_used: seller.phone_used,
+        email_used: seller.email_used,
+        phone_remaining: isUnlimited ? null : Math.max(pkg.buyer_contact_limit - seller.phone_used, 0),
+        email_remaining: isUnlimited ? null : Math.max(pkg.buyer_contact_limit - seller.email_used, 0),
+      },
+    });
+  } catch (err) {
+    console.error("GET /api/:id/package ERROR:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
 app.post('/send-email', async (req, res) => {
   const { product, subject, message, historyPayload, seller_id } = req.body;
 
@@ -1807,13 +1891,12 @@ app.get('/history/:id/replies', async (req, res) => {
         c.contact_name
       FROM email_replies r
       LEFT JOIN email_history_companies c
-        ON c.history_id = r.batch_id AND c.email = r.from_email
+        ON c.batch_id = r.batch_id AND c.email = r.from_email  // ✅ Fixed - changed to batch_id
       WHERE r.batch_id = ?
       ORDER BY r.reply_date DESC
     `, [id]);
 
     res.json({ batchId: id, total: replies.length, replies });
-
   } catch (err) {
     console.error('GET /history/:id/replies error:', err);
     res.status(500).json({ error: err.message });
@@ -3153,8 +3236,9 @@ app.post("/api/seller/login", async (req, res) => {
     });
   }
 });
-app.post("/api/store-user", async (req, res) => {
+app.put("/api/store-user", async (req, res) => {
   try {
+    console.log("=== UPSERT USER REQUEST STARTED ===");
     const {
       id,
       email,
@@ -3173,50 +3257,65 @@ app.post("/api/store-user", async (req, res) => {
       });
     }
 
-    const [existing] = await pool.execute(
-      "SELECT user_id, id, email FROM users WHERE id = ?",
-      [id]
-    );
-
-    if (existing.length > 0) {
-      return res.status(200).json({
-        success: true,
-        exists: true,
-        message: "User already exists",
-        user_id: existing[0].user_id,
-        id: existing[0].id,
-        email: existing[0].email,
-      });
-    }
-
-    // 👇 sanitize undefined -> null
+    // Sanitize values
     const safeRole = role ?? "seller";
     const safeName = name ?? null;
     const safePhone = phone ?? null;
     const safePackageId = package_id ?? null;
     const safePackExpDate = pack_exp_date ?? null;
 
-    const [result] = await pool.execute(
-      `INSERT INTO users
-      (id, email, password, role, name, phone_number, package_id, package_expire, email_sent, email_config)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0)`,
-      [
-        id,
-        email,
-        password,
-        safeRole,
-        safeName,
-        safePhone,
-        safePackageId,
-        safePackExpDate,
-      ]
+    // Check if user exists
+    const [existing] = await pool.execute(
+      "SELECT user_id FROM users WHERE id = ?",
+      [id]
     );
 
-    res.status(201).json({
+    if (existing.length === 0) {
+      // User doesn't exist - INSERT
+      console.log(`🆕 User not found, creating new user with ID: ${id}`);
+      
+      const [result] = await pool.execute(
+        `INSERT INTO users
+        (id, email, password, role, name, phone_number, package_id, package_expire, email_sent, email_config)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0)`,
+        [id, email, password, safeRole, safeName, safePhone, safePackageId, safePackExpDate]
+      );
+
+      return res.status(201).json({
+        success: true,
+        message: "User created successfully",
+        action: "inserted",
+        user_id: result.insertId,
+        id,
+        email,
+        role: safeRole,
+        name: safeName,
+        phone: safePhone,
+        package_id: safePackageId,
+        pack_exp_date: safePackExpDate,
+      });
+    }
+
+    // User exists - UPDATE
+    console.log(`✅ User found with ID: ${id}, updating...`);
+    
+    await pool.execute(
+      `UPDATE users
+       SET email = ?,
+           password = ?,
+           role = ?,
+           name = ?,
+           phone_number = ?,
+           package_id = ?,
+           package_expire = ?
+       WHERE id = ?`,
+      [email, password, safeRole, safeName, safePhone, safePackageId, safePackExpDate, id]
+    );
+
+    res.json({
       success: true,
-      exists: false,
-      message: "User stored successfully",
-      user_id: result.insertId,
+      message: "User updated successfully",
+      action: "updated",
       id,
       email,
       role: safeRole,
@@ -3225,17 +3324,9 @@ app.post("/api/store-user", async (req, res) => {
       package_id: safePackageId,
       pack_exp_date: safePackExpDate,
     });
+
   } catch (err) {
-    console.error("Error in /api/store-user:", err);
-
-    if (err.code === "ER_DUP_ENTRY") {
-      return res.status(409).json({
-        success: false,
-        message: "User with this ID already exists",
-        error: err.message,
-      });
-    }
-
+    console.error("Error in /api/store-user (PUT):", err);
     res.status(500).json({
       success: false,
       message: err.message,
@@ -3577,87 +3668,7 @@ app.get("/api/package/:packageId", async (req, res) => {
   }
 });
 
-app.get("/api/:id/package", async (req, res) => {
-  try {
-    const sellerId = String(req.params.id).trim();
-    console.log("Fetching package info for seller_id:", sellerId);
 
-    // Local: seller's package assignment, expiry, usage
-    const [sellerRows] = await pool.query(
-      `SELECT
-          id,
-          name,
-          package_id,
-          package_expire,
-          phone_used,
-          email_used
-       FROM users
-       WHERE id = ?`,
-      [sellerId]
-    );
-
-    if (sellerRows.length === 0) {
-      return res.status(404).json({ success: false, error: "Seller not found" });
-    }
-
-    const seller = sellerRows[0];
-
-    if (!seller.package_id) {
-      return res.json({
-        success: true,
-        data: {
-          package_id: null,
-          package_name: null,
-          package_expire: seller.package_expire,
-          is_expired: !seller.package_expire || new Date(seller.package_expire) < new Date(),
-          buyer_contact_limit: null,
-          phone_used: seller.phone_used,
-          email_used: seller.email_used,
-          phone_remaining: null,
-          email_remaining: null,
-        },
-      });
-    }
-
-    // Remote: package details + limit
-    const [pkgRows] = await remotePool.query(
-      `SELECT id, package_name, buyer_contact_limit
-       FROM tbl_package_membership
-       WHERE id = ?`,
-      [seller.package_id]
-    );
-
-    if (pkgRows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        error: "PACKAGE_NOT_FOUND",
-        message: "Assigned package not found in remote database.",
-      });
-    }
-
-    const pkg = pkgRows[0];
-    const isUnlimited = pkg.buyer_contact_limit === null;
-    const isExpired = !seller.package_expire || new Date(seller.package_expire) < new Date();
-
-    res.json({
-      success: true,
-      data: {
-        package_id: pkg.id,
-        package_name: pkg.package_name,
-        package_expire: seller.package_expire,
-        is_expired: isExpired,
-        buyer_contact_limit: pkg.buyer_contact_limit,
-        phone_used: seller.phone_used,
-        email_used: seller.email_used,
-        phone_remaining: isUnlimited ? null : Math.max(pkg.buyer_contact_limit - seller.phone_used, 0),
-        email_remaining: isUnlimited ? null : Math.max(pkg.buyer_contact_limit - seller.email_used, 0),
-      },
-    });
-  } catch (err) {
-    console.error("GET /api/:id/package ERROR:", err);
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
 app.use('/', buyerRoutes);
 app.use('/', bulkBuyerRoutes);
 app.use('/', userRoutes);

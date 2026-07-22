@@ -37,18 +37,33 @@ router.get('/sso/login', async (req, res) => {
       name: decoded.name,
       externalId: decoded.sub,
       role: decoded.role,
+      package_id: decoded.package_id,
+      package_name: decoded.package_name,
+      effective_package_id: decoded.effective_package_id,
+      effective_package_name: decoded.effective_package_name,
+      plan_expiry_date: decoded.plan_expiry_date,
+      payment_status: decoded.payment_status,
     });
 
     // Establish the buyer-tool's own session
     req.session.userId = user.id;
-    req.session.email = user.email;
+    req.session.email = decoded.email;
+    req.session.sub = decoded.sub;
+    req.session.name = decoded.name;
+    req.session.role = decoded.role;
+    req.session.package_id = decoded.package_id;
+    req.session.package_name = decoded.package_name;
+    req.session.effective_package_id = decoded.effective_package_id;
+    req.session.effective_package_name = decoded.effective_package_name;
+    req.session.plan_expiry_date = decoded.plan_expiry_date;
+    req.session.payment_status = decoded.payment_status;
 
     req.session.save((err) => {
       if (err) {
         console.error('Session save error:', err);
         return res.redirect('/login?error=session_failed');
       }
-      res.redirect('/search'); // buyer tool's real landing page
+      res.redirect(`/search?token=${token}&sub=${decoded.sub}&email=${decoded.email}&name=${decoded.name}&role=${decoded.role}&package_id=${decoded.package_id}&package_name=${decoded.package_name}&effective_package_id=${decoded.effective_package_id}&effective_package_name=${decoded.effective_package_name}&plan_expiry_date=${decoded.plan_expiry_date}&payment_status=${decoded.payment_status}`);
     });
 
   } catch (err) {
