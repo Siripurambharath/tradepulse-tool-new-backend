@@ -18,7 +18,23 @@ const bulkBuyerRoutes = require('./routes/bulkBuyerRoutes');
 const userRoutes = require('./routes/UsersRoutes');
 const app = express();
 
-app.use(cors());
+const allowedOrigins = [
+  'https://test-buyers.globpulse.com',
+  'https://buyers.globpulse.com',
+  'https://gfe-seller-dashboard.com'
+];
+
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true
+}));
+
 app.use(express.json());
 
 
@@ -42,7 +58,7 @@ const pool = mysql.createPool({
   host: "localhost",
   user: "root",
   password: "",
-  database: "seller_buyer_dummy",
+  database: "seller_buyer_dummy_old",
   waitForConnections: true,
   connectionLimit: 20,
 });
@@ -305,17 +321,100 @@ emailQueue.on('failed', (job, err) => {
 });
 
 
+// app.get("/api/:id/package", async (req, res) => {
+//   try {
+//     const sellerId = String(req.params.id).trim();
+//     console.log("Fetching package info for seller_id:", sellerId);
+
+//     // Local: seller's package assignment, expiry, usage
+//     const [sellerRows] = await pool.query(
+//       `SELECT
+//           id,
+//           name,
+//           package_id,
+//           package_expire,
+//           phone_used,
+//           email_used
+//        FROM users
+//        WHERE id = ?`,
+//       [sellerId]
+//     );
+
+//     if (sellerRows.length === 0) {
+//       return res.status(404).json({ success: false, error: "Seller not found" });
+//     }
+
+//     const seller = sellerRows[0];
+
+//     if (!seller.package_id) {
+//       return res.json({
+//         success: true,
+//         data: {
+//           package_id: null,
+//           package_name: null,
+//           package_expire: seller.package_expire,
+//           is_expired: !seller.package_expire || new Date(seller.package_expire) < new Date(),
+//           buyer_contact_limit: null,
+//           phone_used: seller.phone_used,
+//           email_used: seller.email_used,
+//           phone_remaining: null,
+//           email_remaining: null,
+//         },
+//       });
+//     }
+
+//     // Remote: package details + limit
+//     const [pkgRows] = await remotePool.query(
+//       `SELECT id, package_name, buyer_contact_limit
+//        FROM tbl_package_membership
+//        WHERE id = ?`,
+//       [seller.package_id]
+//     );
+// console.log("id:", pkgRows[0].id);
+// console.log("package_name:", pkgRows[0].package_name);
+// console.log("buyer_contact_limit:", pkgRows[0].buyer_contact_limit);
+//     if (pkgRows.length === 0) {
+//       return res.status(404).json({
+//         success: false,
+//         error: "PACKAGE_NOT_FOUND",
+//         message: "Assigned package not found in remote database.",
+//       });
+//     }
+
+//     const pkg = pkgRows[0];
+//     const isUnlimited = pkg.buyer_contact_limit === null;
+//     const isExpired = !seller.package_expire || new Date(seller.package_expire) < new Date();
+
+//     res.json({
+//       success: true,
+//       data: {
+//         package_id: pkg.id,
+//         package_name: pkg.package_name,
+//         package_expire: seller.package_expire,
+//         is_expired: isExpired,
+//         buyer_contact_limit: pkg.buyer_contact_limit,
+//         phone_used: seller.phone_used,
+//         email_used: seller.email_used,
+//         phone_remaining: isUnlimited ? null : Math.max(pkg.buyer_contact_limit - seller.phone_used, 0),
+//         email_remaining: isUnlimited ? null : Math.max(pkg.buyer_contact_limit - seller.email_used, 0),
+//       },
+//     });
+//   } catch (err) {
+//     console.error("GET /api/:id/package ERROR:", err);
+//     res.status(500).json({ success: false, error: err.message });
+//   }
+// });
 app.get("/api/:id/package", async (req, res) => {
   try {
     const sellerId = String(req.params.id).trim();
-    console.log("Fetching package info for seller_id:", sellerId);
 
-    // Local: seller's package assignment, expiry, usage
-    const [sellerRows] = await pool.query(
+    console.log("Fetching package info for seller:", sellerId);
+
+    // 1. Local DB - usage only
+    const [userRows] = await pool.query(
       `SELECT
           id,
           name,
-          package_id,
           package_expire,
           phone_used,
           email_used
@@ -324,70 +423,112 @@ app.get("/api/:id/package", async (req, res) => {
       [sellerId]
     );
 
-    if (sellerRows.length === 0) {
-      return res.status(404).json({ success: false, error: "Seller not found" });
+    if (userRows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Seller not found in local database",
+      });
     }
 
-    const seller = sellerRows[0];
+    const user = userRows[0];
 
-    if (!seller.package_id) {
+    // 2. Remote DB - seller package
+    const [sellerRows] = await remotePool.query(
+      `SELECT id, package_id
+       FROM sellers
+       WHERE id = ?`,
+      [sellerId]
+    );
+
+    if (sellerRows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Seller not found in remote database",
+      });
+    }
+
+    const remoteSeller = sellerRows[0];
+
+    if (!remoteSeller.package_id) {
       return res.json({
         success: true,
         data: {
           package_id: null,
           package_name: null,
-          package_expire: seller.package_expire,
-          is_expired: !seller.package_expire || new Date(seller.package_expire) < new Date(),
+          package_expire: user.package_expire,
+          is_expired:
+            !user.package_expire ||
+            new Date(user.package_expire) < new Date(),
           buyer_contact_limit: null,
-          phone_used: seller.phone_used,
-          email_used: seller.email_used,
+          phone_used: user.phone_used,
+          email_used: user.email_used,
           phone_remaining: null,
           email_remaining: null,
         },
       });
     }
 
-    // Remote: package details + limit
+    // 3. Remote DB - package details
     const [pkgRows] = await remotePool.query(
-      `SELECT id, package_name, buyer_contact_limit
+      `SELECT
+          id,
+          package_name,
+          buyer_contact_limit
        FROM tbl_package_membership
        WHERE id = ?`,
-      [seller.package_id]
+      [remoteSeller.package_id]
     );
-console.log("id:", pkgRows[0].id);
-console.log("package_name:", pkgRows[0].package_name);
-console.log("buyer_contact_limit:", pkgRows[0].buyer_contact_limit);
+
     if (pkgRows.length === 0) {
       return res.status(404).json({
         success: false,
-        error: "PACKAGE_NOT_FOUND",
-        message: "Assigned package not found in remote database.",
+        message: "Package not found",
       });
     }
 
     const pkg = pkgRows[0];
-    const isUnlimited = pkg.buyer_contact_limit === null;
-    const isExpired = !seller.package_expire || new Date(seller.package_expire) < new Date();
 
-    res.json({
+    const limit = pkg.buyer_contact_limit;
+    const isUnlimited = limit === null;
+
+    const phoneUsed = Number(user.phone_used || 0);
+    const emailUsed = Number(user.email_used || 0);
+
+    const isExpired =
+      !user.package_expire ||
+      new Date(user.package_expire) < new Date();
+
+    return res.json({
       success: true,
       data: {
         package_id: pkg.id,
         package_name: pkg.package_name,
-        package_expire: seller.package_expire,
+        package_expire: user.package_expire,
         is_expired: isExpired,
-        buyer_contact_limit: pkg.buyer_contact_limit,
-        phone_used: seller.phone_used,
-        email_used: seller.email_used,
-        phone_remaining: isUnlimited ? null : Math.max(pkg.buyer_contact_limit - seller.phone_used, 0),
-        email_remaining: isUnlimited ? null : Math.max(pkg.buyer_contact_limit - seller.email_used, 0),
+
+        buyer_contact_limit: limit,
+
+        phone_used: phoneUsed,
+        email_used: emailUsed,
+
+        phone_remaining: isUnlimited
+          ? null
+          : Math.max(limit - phoneUsed, 0),
+
+        email_remaining: isUnlimited
+          ? null
+          : Math.max(limit - emailUsed, 0),
       },
     });
   } catch (err) {
-    console.error("GET /api/:id/package ERROR:", err);
-    res.status(500).json({ success: false, error: err.message });
+    console.error(err);
+    return res.status(500).json({
+      success: false,
+      error: err.message,
+    });
   }
 });
+
 app.post('/send-email', async (req, res) => {
   const { product, subject, message, historyPayload, seller_id } = req.body;
 
@@ -3639,16 +3780,41 @@ app.get("/status/:userId", async (req, res) => {
 });
 
 
-app.get("/api/package/:packageId", async (req, res) => {
+app.get("/api/package/:sellerId", async (req, res) => {
   try {
-    const { packageId } = req.params;
+    const { sellerId } = req.params;
 
-    const [rows] = await remotePool.execute(
-      "SELECT id, package_name FROM tbl_package_membership WHERE id = ?",
+    // Get package_id from sellers table
+    const [sellerRows] = await remotePool.execute(
+      "SELECT package_id FROM sellers WHERE id = ?",
+      [sellerId]
+    );
+
+    if (!sellerRows.length) {
+      return res.status(404).json({
+        success: false,
+        message: "Seller not found",
+      });
+    }
+
+    const packageId = sellerRows[0].package_id;
+
+    if (!packageId) {
+      return res.status(404).json({
+        success: false,
+        message: "No package assigned to this seller",
+      });
+    }
+
+    // Get package details
+    const [packageRows] = await remotePool.execute(
+      `SELECT id, package_name, buyer_contact_limit
+       FROM tbl_package_membership
+       WHERE id = ?`,
       [packageId]
     );
 
-    if (!rows.length) {
+    if (!packageRows.length) {
       return res.status(404).json({
         success: false,
         message: "Package not found",
@@ -3657,17 +3823,86 @@ app.get("/api/package/:packageId", async (req, res) => {
 
     res.json({
       success: true,
-      data: rows[0],
+      data: packageRows[0],
     });
+
   } catch (err) {
-    console.error(err);
+    console.error("Error fetching package:", err);
     res.status(500).json({
       success: false,
       message: "Internal server error",
+      error: err.message,
     });
   }
 });
+app.get("/buyers-old", async (req, res) => {
+  try {
+    const limit = Number(req.query.limit || 50);
+    const offset = Number(req.query.offset || 0);
 
+    const search = req.query.search || "";
+    const country = req.query.country || "";
+    const product = req.query.product || "";
+
+    let where = [];
+    let values = [];
+
+    if (search) {
+      where.push(`(
+        b.company_name LIKE ?
+        OR b.country LIKE ?
+        OR b.product LIKE ?
+        OR b.hsn_code LIKE ?
+        OR b.website LIKE ?
+      )`);
+      values.push(`%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`);
+    }
+
+    if (country) {
+      where.push(`b.country = ?`);
+      values.push(country);
+    }
+
+    if (product) {
+      where.push(`b.product = ?`);
+      values.push(product);
+    }
+
+    const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+
+    const sql = `
+      SELECT
+        b.id AS buyer_id,
+        b.buyer_date,
+        b.product,
+        b.hsn_code,
+        b.country,
+        b.company_name,
+        b.website,
+        GROUP_CONCAT(DISTINCT bc.contact_number SEPARATOR ', ') AS contacts,
+        GROUP_CONCAT(DISTINCT be.email SEPARATOR ', ') AS emails
+      FROM buyers b
+      LEFT JOIN buyer_contacts bc ON b.id = bc.buyer_id
+      LEFT JOIN buyer_emails be ON b.id = be.buyer_id
+      ${whereClause}
+      GROUP BY b.id
+      ORDER BY b.id DESC
+      LIMIT ? OFFSET ?
+    `;
+
+    const [rows] = await pool.query(sql, [...values, limit, offset]);
+    const [countRows] = await pool.query(
+      `SELECT COUNT(*) AS total FROM buyers b ${whereClause}`,
+      values
+    );
+
+    res.json({ data: rows, total: countRows[0].total });
+
+  } catch (err) {
+    console.error("GET /buyers ERROR:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 app.use('/', buyerRoutes);
 app.use('/', bulkBuyerRoutes);

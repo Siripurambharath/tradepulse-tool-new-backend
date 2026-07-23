@@ -22,7 +22,8 @@ async function importExcel() {
     const today = new Date().toISOString().split("T")[0];
 
     let totalImported = 0;
-    let totalSkipped = 0;
+    let totalSkippedDuplicate = 0;
+    let totalSkippedNoContact = 0;
 
     for (const row of rows) {
       const companyName = String(row["Company Name"] || "").trim();
@@ -38,12 +39,11 @@ async function importExcel() {
       );
 
       if (existing.length > 0) {
-        totalSkipped++;
+        totalSkippedDuplicate++;
         console.log(`Skipped (duplicate) -> ${companyName}`);
         continue;
       }
 
-      const product = String(row["Product Category"] || "").trim();
       const website = String(row["Website"] || "").trim();
       const country = String(row["Country"] || "").trim();
       const address = String(row["Add."] || "").trim();
@@ -53,6 +53,12 @@ async function importExcel() {
       const reason = String(row["Reason for HS Code Selection"] || "").trim();
       const classificationNotes = String(row["Classification Notes"] || "").trim();
       const manualVerification = String(row["Manual Verification Required – Yes/No"] || "").trim();
+
+      /* PRODUCT NAME - use Product Category; if empty/"Unclassified", fall back to Details */
+      let product = String(row["Product Category"] || "").trim();
+      if (!product || product.toLowerCase() === "unclassified") {
+        product = details;
+      }
 
       /* COLLECT HS CODES + DESCRIPTIONS 1-5 */
       const hsCodes = [];
@@ -71,6 +77,28 @@ async function importExcel() {
 
       const hsnCode = hsCodes.join(" / ");
       const hsnDescriptions = hsDescriptions.join(" / ");
+
+      /* CONTACTS */
+      const contacts = String(row["Contact No. "] || "")
+        .replace(/Telephone|Phone|Mobile|Tel:|Fax:/gi, "")
+        .split(/\n|\/|,/)
+        .map((x) => x.trim())
+        .filter(Boolean);
+
+      /* EMAILS - drop any @example.com addresses */
+      const emails = String(row["Email Ids."] || "")
+        .replace(/Email:/gi, "")
+        .split(/\n|\/|,|;/)
+        .map((x) => x.trim())
+        .filter(Boolean)
+        .filter((e) => !e.toLowerCase().includes("@example.com"));
+
+      /* SKIP ROW - if there is no contact number AND no email left */
+      if (contacts.length === 0 && emails.length === 0) {
+        totalSkippedNoContact++;
+        console.log(`Skipped (no contact/email) -> ${companyName}`);
+        continue;
+      }
 
       /* INSERT BUYER */
       const [buyerResult] = await db.execute(
@@ -99,26 +127,12 @@ async function importExcel() {
 
       const buyerId = buyerResult.insertId;
 
-      /* CONTACTS */
-      const contacts = String(row["Contact No. "] || "")
-        .replace(/Telephone|Phone|Mobile|Tel:|Fax:/gi, "")
-        .split(/\n|\/|,/)
-        .map((x) => x.trim())
-        .filter(Boolean);
-
       for (const contact of contacts) {
         await db.execute(
           `INSERT INTO buyer_contacts (buyer_id, contact_number) VALUES (?,?)`,
           [buyerId, contact]
         );
       }
-
-      /* EMAILS */
-      const emails = String(row["Email Ids."] || "")
-        .replace(/Email:/gi, "")
-        .split(/\n|\/|,|;/)
-        .map((x) => x.trim())
-        .filter(Boolean);
 
       for (const email of emails) {
         await db.execute(
@@ -134,7 +148,8 @@ async function importExcel() {
     console.log("================================");
     console.log("Import Completed");
     console.log("Total Imported:", totalImported);
-    console.log("Total Skipped (duplicates):", totalSkipped);
+    console.log("Total Skipped (duplicates):", totalSkippedDuplicate);
+    console.log("Total Skipped (no contact/email):", totalSkippedNoContact);
 
     await db.end();
   } catch (err) {
