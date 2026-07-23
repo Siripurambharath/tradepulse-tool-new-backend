@@ -432,9 +432,12 @@ app.get("/api/:id/package", async (req, res) => {
 
     const user = userRows[0];
 
-    // 2. Remote DB - seller package
+    // 2. Remote DB - seller package and plan_expiry_date
     const [sellerRows] = await remotePool.query(
-      `SELECT id, package_id
+      `SELECT 
+          id, 
+          package_id,
+          plan_expiry_date
        FROM sellers
        WHERE id = ?`,
       [sellerId]
@@ -449,19 +452,22 @@ app.get("/api/:id/package", async (req, res) => {
 
     const remoteSeller = sellerRows[0];
 
+    // Use plan_expiry_date from remote sellers table
+    const planExpiryDate = remoteSeller.plan_expiry_date;
+    const isExpired = !planExpiryDate || new Date(planExpiryDate) < new Date();
+
     if (!remoteSeller.package_id) {
       return res.json({
         success: true,
         data: {
           package_id: null,
           package_name: null,
-          package_expire: user.package_expire,
-          is_expired:
-            !user.package_expire ||
-            new Date(user.package_expire) < new Date(),
+          package_expire: user.package_expire || null,
+          plan_expiry_date: planExpiryDate || null,
+          is_expired: isExpired,
           buyer_contact_limit: null,
-          phone_used: user.phone_used,
-          email_used: user.email_used,
+          phone_used: user.phone_used || 0,
+          email_used: user.email_used || 0,
           phone_remaining: null,
           email_remaining: null,
         },
@@ -494,34 +500,23 @@ app.get("/api/:id/package", async (req, res) => {
     const phoneUsed = Number(user.phone_used || 0);
     const emailUsed = Number(user.email_used || 0);
 
-    const isExpired =
-      !user.package_expire ||
-      new Date(user.package_expire) < new Date();
-
     return res.json({
       success: true,
       data: {
         package_id: pkg.id,
         package_name: pkg.package_name,
-        package_expire: user.package_expire,
+        package_expire: user.package_expire || null,
+        plan_expiry_date: planExpiryDate || null,
         is_expired: isExpired,
-
         buyer_contact_limit: limit,
-
         phone_used: phoneUsed,
         email_used: emailUsed,
-
-        phone_remaining: isUnlimited
-          ? null
-          : Math.max(limit - phoneUsed, 0),
-
-        email_remaining: isUnlimited
-          ? null
-          : Math.max(limit - emailUsed, 0),
+        phone_remaining: isUnlimited ? null : Math.max(limit - phoneUsed, 0),
+        email_remaining: isUnlimited ? null : Math.max(limit - emailUsed, 0),
       },
     });
   } catch (err) {
-    console.error(err);
+    console.error("Error fetching package info:", err);
     return res.status(500).json({
       success: false,
       error: err.message,
