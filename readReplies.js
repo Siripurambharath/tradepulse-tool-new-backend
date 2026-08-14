@@ -2,13 +2,15 @@ const Imap = require('node-imap');
 const { simpleParser } = require('mailparser');
 const mysql = require('mysql2/promise');
 require('dotenv').config();
+const pool = require("./db");
 
-const pool = mysql.createPool({
-  host: 'localhost',
-  user: 'root',
-  password: '',
-  database: 'seller_buyer_dummy',
-});
+
+// const pool = mysql.createPool({
+//   host: 'localhost',
+//   user: 'root',
+//   password: '',
+//   database: 'seller_buyer_dummy',
+// });
 
 function resolveImapSettings(profile) {
   if (!profile.imap_host) return null;

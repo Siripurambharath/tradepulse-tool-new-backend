@@ -34,4 +34,34 @@ router.get("/users", async (req, res) => {
   }
 });
 
+// GET USER STATUS BY ID
+router.get("/status/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    const [rows] = await pool.query(
+      `SELECT email_config, email_sent FROM users WHERE id = ?`,
+      [userId]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found"
+      });
+    }
+
+    res.json({
+      success: true,
+      data: rows[0]
+    });
+  } catch (err) {
+    console.log(err);
+    res.status(500).json({
+      success: false,
+      message: "Server Error"
+    });
+  }
+});
+
 module.exports = router;

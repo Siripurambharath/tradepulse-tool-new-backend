@@ -80,7 +80,6 @@ const remotePool = mysql.createPool({
   database: "b2b",
   waitForConnections: true,
   connectionLimit: 5,
-  
 });
 
 app.set('remotePool', remotePool);
@@ -213,18 +212,11 @@ emailQueue.process(async (job) => {
     batchId,
     sellerId,
     emailProfile,
-    cc = [],           
-    hasCc = false,     
-    showCc = false    
   } = job.data;
 
   console.log(`Processing job for ${recipientEmail} in batch ${batchId} via profile ${emailProfile?.profile_name} (seller_id=${sellerId})`);
   console.log(`📞 Contact Number: ${company.contacts || 'Not provided'}`);
   console.log(`📦 HSN Code: ${company.hsn_code || 'Not provided'}`);
-  
-  if (hasCc && cc.length > 0) {
-    console.log(`📋 CC recipients: ${cc.join(', ')}`);
-  }
 
   await job.progress(20);
 
@@ -245,28 +237,17 @@ emailQueue.process(async (job) => {
     const interestedUrl = `${BASE_URL}/track-response?batchId=${batchId}&email=${encodeURIComponent(recipientEmail)}&response=interested`;
     const notInterestedUrl = `${BASE_URL}/track-response?batchId=${batchId}&email=${encodeURIComponent(recipientEmail)}&response=not_interested`;
 
-    const mailOptions = {
+    const info = await transporter.sendMail({
       from: `"${emailProfile.sender_name}" <${emailProfile.sender_email}>`,
       to: recipientEmail,
-      cc: hasCc && cc.length > 0 ? cc.join(', ') : undefined, 
       subject: trackedSubject,
       html: buildHtml(message, originalProduct, interestedUrl, notInterestedUrl),
       headers: {
         'X-Batch-ID': batchId,
         'X-Product': product,
         'Message-ID': `<${batchId}-${Date.now()}@yourdomain.com>`,
-        'X-CC-Enabled': hasCc ? 'true' : 'false',  
-        'X-CC-Recipients': hasCc ? cc.join(', ') : '',  
       },
-    };
-
-    console.log(`📧 Mail options:`, {
-      to: mailOptions.to,
-      cc: mailOptions.cc || 'None',
-      subject: mailOptions.subject
     });
-
-    const info = await transporter.sendMail(mailOptions);
 
     messageId = info.messageId;
     console.log(`✅ Sent to ${recipientEmail} via ${emailProfile.sender_email} [${messageId}]`);
@@ -293,38 +274,33 @@ emailQueue.process(async (job) => {
         `UPDATE email_history_companies 
          SET sent_at = ?, status = ?, template_used = ?, template_id = ?, 
              product_name = ?, multiple_products = ?, buyer_id = ?, seller_id = ?,
-             contact_name = ?, hsn_code = ?,
-             has_cc = ?, cc_emails = ?  -- ✅ NEW
+             contact_name = ?, hsn_code = ?
          WHERE batch_id = ? AND email = ?`,
         [new Date(), sendStatus, company.templateUsed || 'Welcome Template',
         company.templateId, originalProduct, job.data.multipleProducts || false,
         company.buyer_id, sellerId,
           contactValue,
           company.hsn_code || '',
-          hasCc ? 1 : 0, JSON.stringify(cc),  // ✅ NEW
           batchId, recipientEmail]
       );
     } else {
       await pool.query(
         `INSERT INTO email_history_companies
           (batch_id, seller_id, buyer_id, company_name, country, contact_name, email, 
-           sent_at, status, template_used, template_id, product_name, multiple_products, hsn_code,
-           has_cc, cc_emails)  -- ✅ NEW
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           sent_at, status, template_used, template_id, product_name, multiple_products, hsn_code)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [batchId, sellerId, company.buyer_id, company.companyName || 'Unknown',
           company.country || null,
           contactValue,
           recipientEmail, new Date(), sendStatus, company.templateUsed || 'Welcome Template',
           company.templateId, originalProduct, job.data.multipleProducts || false,
-          company.hsn_code || '',
-          hasCc ? 1 : 0, JSON.stringify(cc)  // ✅ NEW
+          company.hsn_code || ''
         ]
       );
     }
 
     console.log(`💾 Stored contact in contact_name: ${contactValue}`);
     console.log(`💾 Stored hsn_code: ${company.hsn_code || 'Not provided'}`);
-    console.log(`💾 Stored CC info: has_cc=${hasCc}, cc_emails=${JSON.stringify(cc)}`);
 
   } catch (dbErr) {
     console.error(`💾 Database error for ${recipientEmail}:`, dbErr.message);
@@ -332,7 +308,7 @@ emailQueue.process(async (job) => {
 
   if (sendError) throw sendError;
 
-  return { recipientEmail, status: sendStatus, messageId, cc: hasCc ? cc : [] };
+  return { recipientEmail, status: sendStatus, messageId };
 });
 
 emailQueue.on('completed', (job, result) => {
@@ -463,135 +439,13 @@ app.get("/api/:id/package", async (req, res) => {
   }
 });
 
-// app.post('/send-email', async (req, res) => {
-//   const { product, subject, message, historyPayload, seller_id } = req.body;
-
-//   console.log('═══════════════════════════════════════');
-//   console.log('📧 SEND EMAIL API - FULL REQUEST BODY');
-//   console.log('═══════════════════════════════════════');
-//   console.log(JSON.stringify(req.body, null, 2));
-
-//   if (!seller_id) {
-//     return res.status(400).json({ error: 'seller_id is required' });
-//   }
-
-//   if (!historyPayload) {
-//     return res.status(400).json({ error: 'historyPayload is required' });
-//   }
-
-//   const { id: batchId, companies } = historyPayload;
-
-//   if (!batchId) {
-//     return res.status(400).json({ error: 'historyPayload.id (batchId) is required' });
-//   }
-
-//   if (!companies || companies.length === 0) {
-//     return res.status(400).json({ error: 'No recipients specified' });
-//   }
-
-//   // Fetch the seller's active email profile BEFORE enqueuing
-//   let emailProfile;
-//   try {
-//     emailProfile = await getEmailProfileBySellerId(seller_id);
-//     console.log(`📨 Using email profile: ${emailProfile.profile_name} (${emailProfile.sender_email})`);
-//   } catch (err) {
-//     console.error('Email profile fetch error:', err.message);
-//     return res.status(404).json({ error: err.message });
-//   }
-
-//   try {
-//     const jobs = await Promise.all(
-//       companies.map((company, index) =>
-//         emailQueue.add(
-//           {
-//             recipientEmail: company.email,
-//             subject,
-//             message,
-//             product: product,
-//             originalProduct: company.product,
-//             company: {
-//               ...company,
-//               buyer_id: company.buyer_id,
-//               templateId: company.templateId,
-//               contacts: company.contacts || company.contact_number || '',  // Pass contacts
-//               contactName: company.contactName || company.contacts || company.companyName || 'Unknown',  
-//                hsn_code: company.hsn_code || '',
-//             },
-//             batchId,
-//             sellerId: seller_id,
-//             multipleProducts: req.body.multipleProducts || false,
-//             emailProfile,
-//           },
-//           {
-//             attempts: 3,
-//             backoff: { type: 'exponential', delay: 3000 },
-//             removeOnComplete: false,
-//             removeOnFail: false,
-//             jobId: `${batchId}-${index}`,
-//           }
-//         )
-//       )
-//     );
-
-//     const jobIds = jobs.map((j) => j.id.toString());
-//     console.log(`Enqueued ${jobIds.length} jobs for batch ${batchId} using seller ${seller_id}`);
-//     console.log(`📞 Contacts passed: ${companies.map(c => c.contacts).join(', ')}`);
-//     res.json({ batchId, jobIds, total: jobIds.length });
-
-//   } catch (err) {
-//     console.error('Queue error:', err);
-//     res.status(500).json({ error: 'Failed to enqueue jobs', details: err.message });
-//   }
-// });
 app.post('/send-email', async (req, res) => {
-  // ✅ NEW: Destructure cc and showCc from request body
-  const { 
-    product, 
-    subject, 
-    message, 
-    historyPayload, 
-    seller_id, 
-    cc = [],           // ✅ NEW: CC emails array
-    showCc = false     // ✅ NEW: CC flag
-  } = req.body;
+  const { product, subject, message, historyPayload, seller_id } = req.body;
 
   console.log('═══════════════════════════════════════');
   console.log('📧 SEND EMAIL API - FULL REQUEST BODY');
   console.log('═══════════════════════════════════════');
   console.log(JSON.stringify(req.body, null, 2));
-
-  // ✅ NEW: Validate CC emails
-  if (showCc && cc && cc.length > 0) {
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    const invalidEmails = cc.filter(email => !emailRegex.test(email));
-    
-    if (invalidEmails.length > 0) {
-      console.error(`❌ Invalid CC emails: ${invalidEmails.join(', ')}`);
-      return res.status(400).json({ 
-        error: `Invalid CC email addresses: ${invalidEmails.join(', ')}` 
-      });
-    }
-
-    // Check for duplicates
-    const uniqueCC = [...new Set(cc)];
-    if (uniqueCC.length !== cc.length) {
-      console.error('❌ Duplicate CC emails found');
-      return res.status(400).json({ 
-        error: 'Duplicate CC email addresses found' 
-      });
-    }
-
-    // Limit CC recipients (max 10)
-    const MAX_CC = 10;
-    if (cc.length > MAX_CC) {
-      console.error(`❌ Too many CC recipients: ${cc.length}`);
-      return res.status(400).json({ 
-        error: `Maximum ${MAX_CC} CC recipients allowed` 
-      });
-    }
-
-    console.log(`📋 CC Recipients (${cc.length}): ${cc.join(', ')}`);
-  }
 
   if (!seller_id) {
     return res.status(400).json({ error: 'seller_id is required' });
@@ -635,18 +489,14 @@ app.post('/send-email', async (req, res) => {
               ...company,
               buyer_id: company.buyer_id,
               templateId: company.templateId,
-              contacts: company.contacts || company.contact_number || '',
-              contactName: company.contactName || company.contacts || company.companyName || 'Unknown',
-              hsn_code: company.hsn_code || '',
+              contacts: company.contacts || company.contact_number || '',  // Pass contacts
+              contactName: company.contactName || company.contacts || company.companyName || 'Unknown',  
+               hsn_code: company.hsn_code || '',
             },
             batchId,
             sellerId: seller_id,
             multipleProducts: req.body.multipleProducts || false,
             emailProfile,
-            // ✅ NEW: Pass CC information
-            cc: showCc ? cc : [],
-            hasCc: showCc && cc.length > 0,
-            showCc: showCc
           },
           {
             attempts: 3,
@@ -662,24 +512,14 @@ app.post('/send-email', async (req, res) => {
     const jobIds = jobs.map((j) => j.id.toString());
     console.log(`Enqueued ${jobIds.length} jobs for batch ${batchId} using seller ${seller_id}`);
     console.log(`📞 Contacts passed: ${companies.map(c => c.contacts).join(', ')}`);
-    
-    // ✅ REMOVED: No need to store CC info separately
-
-    // ✅ NEW: Enhanced response with CC info
-    res.json({ 
-      batchId, 
-      jobIds, 
-      total: jobIds.length,
-      cc: showCc ? cc : [],
-      hasCc: showCc && cc.length > 0,
-      message: `Emails queued successfully for ${companies.length} recipients${showCc && cc.length > 0 ? ` with ${cc.length} CC recipients` : ''}`
-    });
+    res.json({ batchId, jobIds, total: jobIds.length });
 
   } catch (err) {
     console.error('Queue error:', err);
     res.status(500).json({ error: 'Failed to enqueue jobs', details: err.message });
   }
 });
+
 
 app.get('/batch-status/:batchId', async (req, res) => {
   const jobIdsParam = req.query.jobIds;
@@ -696,9 +536,6 @@ app.get('/batch-status/:batchId', async (req, res) => {
         if (!job) return { jobId, state: 'not_found', progress: 0, email: null };
 
         const state = await job.getState();
-        const hasCc = job.data?.hasCc || false;
-        const ccEmails = job.data?.cc || [];
-
         return {
           jobId,
           email: job.data.recipientEmail,
@@ -707,8 +544,6 @@ app.get('/batch-status/:batchId', async (req, res) => {
           progress: job._progress || 0,
           result: state === 'completed' ? job.returnvalue : null,
           reason: state === 'failed' ? job.failedReason : null,
-          cc: ccEmails, 
-          hasCc: hasCc   
         };
       })
     );
@@ -718,23 +553,6 @@ app.get('/batch-status/:batchId', async (req, res) => {
     const failed = jobStatuses.filter((j) => j.state === 'failed').length;
     const active = jobStatuses.filter((j) => j.state === 'active').length;
     const waiting = jobStatuses.filter((j) => ['waiting', 'delayed'].includes(j.state)).length;
-
-    let ccInfo = { hasCc: false, ccEmails: [] };
-    try {
-      // Check if any job has CC
-      const hasAnyCc = jobStatuses.some(j => j.hasCc === true);
-      const allCcEmails = jobStatuses
-        .filter(j => j.cc && j.cc.length > 0)
-        .flatMap(j => j.cc);
-      const uniqueCcEmails = [...new Set(allCcEmails)];
-      
-      ccInfo = {
-        hasCc: hasAnyCc,
-        ccEmails: uniqueCcEmails
-      };
-    } catch (err) {
-      console.error('Error fetching CC info:', err);
-    }
 
     res.json({
       batchId: req.params.batchId,
@@ -746,8 +564,6 @@ app.get('/batch-status/:batchId', async (req, res) => {
       allDone: completed + failed === total,
       overallProgress: total > 0 ? Math.round(((completed + failed) / total) * 100) : 0,
       jobs: jobStatuses,
-      hasCc: ccInfo.hasCc || false,  
-      ccEmails: ccInfo.ccEmails || [] 
     });
 
   } catch (err) {
@@ -755,6 +571,7 @@ app.get('/batch-status/:batchId', async (req, res) => {
     res.status(500).json({ error: 'Failed to get batch status' });
   }
 });
+
 
 app.get("/api/package/:sellerId", async (req, res) => {
   try {
