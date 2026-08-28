@@ -75,13 +75,14 @@ app.use(session({
 
 const remotePool = mysql.createPool({
   host: "89.116.20.241",
-  user: "b2buser",
-  password: "5-kFm?qpumuZWTwk9lXa",
-  database: "b2b",
+  user: "b2b_remote_user_b2b",
+  password: "RK^D??9DSgX5Z=;B",
+  database: "b2b_remote_db",
   waitForConnections: true,
   connectionLimit: 5,
   
 });
+
 
 app.set('remotePool', remotePool);
 app.set('pool', pool);

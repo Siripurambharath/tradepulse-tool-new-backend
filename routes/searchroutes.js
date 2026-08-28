@@ -105,152 +105,429 @@ router.post('/api/store-response', async (req, res) => {
 });
 
 // Reveal contact endpoint
-router.post('/buyers/:id/reveal-contact', async (req, res) => {
-  const pool = req.app.get('pool');
-  const remotePool = req.app.get('remotePool');
-  const conn = await pool.getConnection();
+// router.post('/buyers/:id/reveal-contact', async (req, res) => {
+//   const pool = req.app.get('pool');
+//   const remotePool = req.app.get('remotePool');
+//   const conn = await pool.getConnection();
   
+//   try {
+//     const buyerId = Number(req.params.id);
+//     const seller_id = String(req.body.seller_id).trim();
+//     const { reveal_type } = req.body;
+
+//     if (!seller_id || isNaN(buyerId)) {
+//       return res.status(400).json({
+//         success: false,
+//         error: "seller_id and buyer id are required",
+//       });
+//     }
+//     if (!["phone", "email"].includes(reveal_type)) {
+//       return res.status(400).json({
+//         success: false,
+//         error: "reveal_type must be 'phone' or 'email'",
+//       });
+//     }
+
+//     await conn.beginTransaction();
+
+//     // Local: get seller's package_id, expiry, and current used counts
+//     const [sellerRows] = await conn.query(
+//       `SELECT
+//           id,
+//           package_id,
+//           package_expire,
+//           phone_used,
+//           email_used
+//        FROM users
+//        WHERE id = ?
+//        FOR UPDATE`,
+//       [seller_id]
+//     );
+
+//     if (sellerRows.length === 0) {
+//       await conn.rollback();
+//       return res.status(404).json({ success: false, error: "Seller not found" });
+//     }
+
+//     const seller = sellerRows[0];
+
+//     // Plan expiry check (local)
+//     if (!seller.package_expire || new Date(seller.package_expire) < new Date()) {
+//       await conn.rollback();
+//       return res.status(403).json({
+//         success: false,
+//         error: "PLAN_EXPIRED",
+//         message: "Your subscription plan has expired. Please renew to reveal contacts.",
+//       });
+//     }
+
+//     if (!seller.package_id) {
+//       await conn.rollback();
+//       return res.status(403).json({
+//         success: false,
+//         error: "NO_PACKAGE",
+//         message: "No active package assigned to this seller.",
+//       });
+//     }
+
+//     // Remote: fetch the buyer_contact_limit tied to this package
+//     const [pkgRows] = await remotePool.query(
+//       `SELECT buyer_contact_limit FROM tbl_package_membership WHERE id = ?`,
+//       [seller.package_id]
+//     );
+
+//     if (pkgRows.length === 0) {
+//       await conn.rollback();
+//       return res.status(404).json({
+//         success: false,
+//         error: "PACKAGE_NOT_FOUND",
+//         message: "Package details not found.",
+//       });
+//     }
+
+//     const buyerContactLimit = pkgRows[0].buyer_contact_limit;
+//     const isUnlimited = buyerContactLimit === null || buyerContactLimit === undefined;
+
+//     // Already revealed?
+//     const [existing] = await conn.query(
+//       `SELECT 1 FROM contact_reveal_history
+//        WHERE seller_id = ? AND buyer_id = ? AND reveal_type = ?`,
+//       [seller_id, buyerId, reveal_type]
+//     );
+//     const alreadyRevealed = existing.length > 0;
+
+//     if (!alreadyRevealed) {
+//       const usedField = reveal_type === "phone" ? "phone_used" : "email_used";
+//       const used = seller[usedField];
+
+//       if (!isUnlimited && used >= buyerContactLimit) {
+//         await conn.rollback();
+//         return res.status(403).json({
+//           success: false,
+//           error: "LIMIT_REACHED",
+//           message: `You've reached your ${reveal_type} reveal limit (${used}/${buyerContactLimit}).`,
+//         });
+//       }
+
+//       await conn.query(
+//         `INSERT INTO contact_reveal_history (seller_id, buyer_id, reveal_type, revealed_at)
+//          VALUES (?, ?, ?, NOW())`,
+//         [seller_id, buyerId, reveal_type]
+//       );
+
+//       if (!isUnlimited) {
+//         await conn.query(
+//           `UPDATE users SET ${usedField} = ${usedField} + 1 WHERE id = ?`,
+//           [seller_id]
+//         );
+//       }
+//     }
+
+//     let data = {};
+//     if (reveal_type === "phone") {
+//       const [rows] = await conn.query(
+//         `SELECT GROUP_CONCAT(DISTINCT contact_number SEPARATOR ', ') AS contacts
+//          FROM buyer_contacts WHERE buyer_id = ?`,
+//         [buyerId]
+//       );
+//       data.contacts = rows[0]?.contacts || null;
+//     } else {
+//       const [rows] = await conn.query(
+//         `SELECT GROUP_CONCAT(DISTINCT email SEPARATOR ', ') AS emails
+//          FROM buyer_emails WHERE buyer_id = ?`,
+//         [buyerId]
+//       );
+//       data.emails = rows[0]?.emails || null;
+//     }
+
+//     await conn.commit();
+//     res.json({ success: true, data });
+//   } catch (err) {
+//     await conn.rollback();
+//     console.error(err);
+//     res.status(500).json({ success: false, error: err.message });
+//   } finally {
+//     conn.release();
+//   }
+// });
+
+
+
+router.post('/buyers/:id/reveal-contact', async (req, res) => {
+  const pool = req.app.get('pool'); // Local database
+  const remotePool = req.app.get('remotePool'); // Remote database
+
+  const conn = await pool.getConnection();
+
   try {
     const buyerId = Number(req.params.id);
-    const seller_id = String(req.body.seller_id).trim();
+    const sellerId = String(req.body.seller_id || '').trim();
     const { reveal_type } = req.body;
 
-    if (!seller_id || isNaN(buyerId)) {
+    // ==========================================
+    // 1. Validate Request
+    // ==========================================
+    if (!sellerId || Number.isNaN(buyerId)) {
       return res.status(400).json({
         success: false,
-        error: "seller_id and buyer id are required",
+        error: 'seller_id and buyer id are required',
       });
     }
-    if (!["phone", "email"].includes(reveal_type)) {
+
+    if (!['phone', 'email'].includes(reveal_type)) {
       return res.status(400).json({
         success: false,
         error: "reveal_type must be 'phone' or 'email'",
       });
     }
 
+    // ==========================================
+    // 2. Start Local Database Transaction
+    // ==========================================
     await conn.beginTransaction();
 
-    // Local: get seller's package_id, expiry, and current used counts
-    const [sellerRows] = await conn.query(
+    // ==========================================
+    // 3. REMOTE DB: Get Seller Package Details
+    // ==========================================
+    const [sellerRows] = await remotePool.query(
       `SELECT
           id,
           package_id,
-          package_expire,
-          phone_used,
-          email_used
-       FROM users
-       WHERE id = ?
-       FOR UPDATE`,
-      [seller_id]
+          plan_expiry_date
+       FROM sellers
+       WHERE id = ?`,
+      [sellerId]
     );
 
     if (sellerRows.length === 0) {
       await conn.rollback();
-      return res.status(404).json({ success: false, error: "Seller not found" });
+
+      return res.status(404).json({
+        success: false,
+        error: 'SELLER_NOT_FOUND',
+        message: 'Seller not found in remote database.',
+      });
     }
 
     const seller = sellerRows[0];
 
-    // Plan expiry check (local)
-    if (!seller.package_expire || new Date(seller.package_expire) < new Date()) {
-      await conn.rollback();
-      return res.status(403).json({
-        success: false,
-        error: "PLAN_EXPIRED",
-        message: "Your subscription plan has expired. Please renew to reveal contacts.",
-      });
-    }
-
+    // ==========================================
+    // 4. Check Package
+    // ==========================================
     if (!seller.package_id) {
       await conn.rollback();
+
       return res.status(403).json({
         success: false,
-        error: "NO_PACKAGE",
-        message: "No active package assigned to this seller.",
+        error: 'NO_PACKAGE',
+        message: 'No active package assigned to this seller.',
       });
     }
 
-    // Remote: fetch the buyer_contact_limit tied to this package
+    // ==========================================
+    // 5. Check Plan Expiry
+    // ==========================================
+    if (
+      !seller.plan_expiry_date ||
+      new Date(seller.plan_expiry_date) < new Date()
+    ) {
+      await conn.rollback();
+
+      return res.status(403).json({
+        success: false,
+        error: 'PLAN_EXPIRED',
+        message:
+          'Your subscription plan has expired. Please renew to reveal contacts.',
+      });
+    }
+
+    // ==========================================
+    // 6. REMOTE DB: Get Package Contact Limit
+    // ==========================================
     const [pkgRows] = await remotePool.query(
-      `SELECT buyer_contact_limit FROM tbl_package_membership WHERE id = ?`,
+      `SELECT
+          id,
+          buyer_contact_limit
+       FROM tbl_package_membership
+       WHERE id = ?`,
       [seller.package_id]
     );
 
     if (pkgRows.length === 0) {
       await conn.rollback();
+
       return res.status(404).json({
         success: false,
-        error: "PACKAGE_NOT_FOUND",
-        message: "Package details not found.",
+        error: 'PACKAGE_NOT_FOUND',
+        message: 'Package details not found.',
       });
     }
 
-    const buyerContactLimit = pkgRows[0].buyer_contact_limit;
-    const isUnlimited = buyerContactLimit === null || buyerContactLimit === undefined;
+    const pkg = pkgRows[0];
 
-    // Already revealed?
-    const [existing] = await conn.query(
-      `SELECT 1 FROM contact_reveal_history
-       WHERE seller_id = ? AND buyer_id = ? AND reveal_type = ?`,
-      [seller_id, buyerId, reveal_type]
+    const buyerContactLimit = pkg.buyer_contact_limit;
+
+    // Null = unlimited
+    const isUnlimited =
+      buyerContactLimit === null ||
+      buyerContactLimit === undefined;
+
+    // ==========================================
+    // 7. LOCAL DB: Get Seller Usage Count
+    // ==========================================
+    const [localSellerRows] = await conn.query(
+      `SELECT
+          id,
+          phone_used,
+          email_used
+       FROM users
+       WHERE id = ?
+       FOR UPDATE`,
+      [sellerId]
     );
+
+    if (localSellerRows.length === 0) {
+      await conn.rollback();
+
+      return res.status(404).json({
+        success: false,
+        error: 'LOCAL_SELLER_NOT_FOUND',
+        message: 'Seller usage record not found in local database.',
+      });
+    }
+
+    const localSeller = localSellerRows[0];
+
+    // ==========================================
+    // 8. Check Already Revealed
+    // ==========================================
+    const [existing] = await conn.query(
+      `SELECT 1
+       FROM contact_reveal_history
+       WHERE seller_id = ?
+         AND buyer_id = ?
+         AND reveal_type = ?
+       LIMIT 1`,
+      [sellerId, buyerId, reveal_type]
+    );
+
     const alreadyRevealed = existing.length > 0;
 
+    // ==========================================
+    // 9. If New Reveal, Check Limit
+    // ==========================================
     if (!alreadyRevealed) {
-      const usedField = reveal_type === "phone" ? "phone_used" : "email_used";
-      const used = seller[usedField];
+      const usedField =
+        reveal_type === 'phone'
+          ? 'phone_used'
+          : 'email_used';
 
-      if (!isUnlimited && used >= buyerContactLimit) {
+      const used = Number(localSeller[usedField] || 0);
+
+      if (!isUnlimited && used >= Number(buyerContactLimit)) {
         await conn.rollback();
+
         return res.status(403).json({
           success: false,
-          error: "LIMIT_REACHED",
+          error: 'LIMIT_REACHED',
           message: `You've reached your ${reveal_type} reveal limit (${used}/${buyerContactLimit}).`,
         });
       }
 
+      // ==========================================
+      // 10. Save Reveal History
+      // ==========================================
       await conn.query(
-        `INSERT INTO contact_reveal_history (seller_id, buyer_id, reveal_type, revealed_at)
+        `INSERT INTO contact_reveal_history
+          (
+            seller_id,
+            buyer_id,
+            reveal_type,
+            revealed_at
+          )
          VALUES (?, ?, ?, NOW())`,
-        [seller_id, buyerId, reveal_type]
+        [sellerId, buyerId, reveal_type]
       );
 
+      // ==========================================
+      // 11. Update Local Usage Count
+      // ==========================================
       if (!isUnlimited) {
         await conn.query(
-          `UPDATE users SET ${usedField} = ${usedField} + 1 WHERE id = ?`,
-          [seller_id]
+          `UPDATE users
+           SET ${usedField} = ${usedField} + 1
+           WHERE id = ?`,
+          [sellerId]
         );
       }
     }
 
+    // ==========================================
+    // 12. Get Buyer Contact Details
+    // ==========================================
     let data = {};
-    if (reveal_type === "phone") {
+
+    if (reveal_type === 'phone') {
       const [rows] = await conn.query(
-        `SELECT GROUP_CONCAT(DISTINCT contact_number SEPARATOR ', ') AS contacts
-         FROM buyer_contacts WHERE buyer_id = ?`,
+        `SELECT
+            GROUP_CONCAT(
+              DISTINCT contact_number
+              SEPARATOR ', '
+            ) AS contacts
+         FROM buyer_contacts
+         WHERE buyer_id = ?`,
         [buyerId]
       );
+
       data.contacts = rows[0]?.contacts || null;
     } else {
       const [rows] = await conn.query(
-        `SELECT GROUP_CONCAT(DISTINCT email SEPARATOR ', ') AS emails
-         FROM buyer_emails WHERE buyer_id = ?`,
+        `SELECT
+            GROUP_CONCAT(
+              DISTINCT email
+              SEPARATOR ', '
+            ) AS emails
+         FROM buyer_emails
+         WHERE buyer_id = ?`,
         [buyerId]
       );
+
       data.emails = rows[0]?.emails || null;
     }
 
+    // ==========================================
+    // 13. Commit Local Transaction
+    // ==========================================
     await conn.commit();
-    res.json({ success: true, data });
+
+    return res.json({
+      success: true,
+      data,
+      package: {
+        package_id: seller.package_id,
+        plan_expiry_date: seller.plan_expiry_date,
+        buyer_contact_limit: buyerContactLimit,
+      },
+    });
+
   } catch (err) {
-    await conn.rollback();
-    console.error(err);
-    res.status(500).json({ success: false, error: err.message });
+    try {
+      await conn.rollback();
+    } catch (rollbackError) {
+      console.error('Rollback Error:', rollbackError);
+    }
+
+    console.error('Reveal Contact Error:', err);
+
+    return res.status(500).json({
+      success: false,
+      error: err.message,
+    });
+
   } finally {
     conn.release();
   }
 });
-
 // Get buyers with search/filter
 router.get('/buyers', async (req, res) => {
   const pool = req.app.get('pool');
