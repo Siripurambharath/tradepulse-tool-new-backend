@@ -449,17 +449,12 @@ router.post('/buyers/:id/reveal-contact', async (req, res) => {
         [sellerId, buyerId, reveal_type]
       );
 
-      // ==========================================
-      // 11. Update Local Usage Count
-      // ==========================================
-      if (!isUnlimited) {
-        await conn.query(
-          `UPDATE users
-           SET ${usedField} = ${usedField} + 1
-           WHERE id = ?`,
-          [sellerId]
-        );
-      }
+   await conn.query(
+  `UPDATE users
+   SET ${usedField} = ${usedField} + 1
+   WHERE id = ?`,
+  [sellerId]
+);
     }
 
     // ==========================================
