@@ -32,24 +32,24 @@ const allowedOrigins = [
 ];
 
 
-app.use(cors({
-  origin: (origin, callback) => {
-    if (!origin || allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error('Not allowed by CORS'));
-    }
-  },
-  credentials: true
-}));
 // app.use(cors({
-//   origin: function (origin, callback) {
-//     console.log("Origin =>", origin);
-//     callback(null, true);
+//   origin: (origin, callback) => {
+//     if (!origin || allowedOrigins.includes(origin)) {
+//       callback(null, true);
+//     } else {
+//       callback(new Error('Not allowed by CORS'));
+//     }
 //   },
-//   credentials: true,
+//   credentials: true
 // }));
-// app.use(express.json());
+app.use(cors({
+  origin: function (origin, callback) {
+    console.log("Origin =>", origin);
+    callback(null, true);
+  },
+  credentials: true,
+}));
+app.use(express.json());
 
 app.use(session({
   secret: process.env.SESSION_SECRET || 'replace-with-a-strong-random-secret',
@@ -813,6 +813,508 @@ app.get("/api/package/:sellerId", async (req, res) => {
   }
 });
 
+app.get('/buyersnew', async (req, res) => {
+  const pool = req.app.get('pool');
+  try {
+    // ---------- SAFE seller_id parsing ----------
+    const rawSeller = req.query.seller_id;
+    const parsedSeller = Number(rawSeller);
+    const sellerId =
+      rawSeller !== undefined &&
+      rawSeller !== '' &&
+      Number.isFinite(parsedSeller) &&
+      parsedSeller > 0
+        ? parsedSeller
+        : null;
+
+    const limit  = Math.min(Number(req.query.limit  || 50), 100);
+    const offset = Number(req.query.offset || 0);
+    const search  = req.query.search  || "";
+    const country = req.query.country || "";
+    const product = req.query.product || "";
+
+    let where = [];
+    let values = [];
+
+    if (search) {
+      where.push(`(
+        b.company_name LIKE ? OR b.country LIKE ? OR b.product LIKE ?
+        OR b.hsn_code LIKE ? OR b.website LIKE ?
+        OR EXISTS (SELECT 1 FROM buyer_emails  be WHERE be.buyer_id = b.id AND be.email          LIKE ?)
+        OR EXISTS (SELECT 1 FROM buyer_contacts bc WHERE bc.buyer_id = b.id AND bc.contact_number LIKE ?)
+      )`);
+      values.push(
+        `%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`,
+        `%${search}%`, `%${search}%`
+      );
+    }
+    if (country) { where.push("b.country = ?"); values.push(country); }
+    if (product) { where.push("b.product = ?"); values.push(product); }
+
+    const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+
+    const [countRows] = await pool.query(
+      `SELECT COUNT(*) AS total FROM buyers b ${whereClause}`,
+      values
+    );
+    const total = countRows[0].total;
+
+    let rows;
+
+    if (sellerId !== null) {
+      const sql = `
+        SELECT
+          b.id AS id, b.buyer_date, b.product, b.hsn_code, b.country,
+          b.company_name, b.website,
+          EXISTS(
+            SELECT 1 FROM contact_reveal_history
+            WHERE seller_id = ? AND buyer_id = b.id AND reveal_type = 'phone'
+          ) AS phone_revealed,
+          EXISTS(
+            SELECT 1 FROM contact_reveal_history
+            WHERE seller_id = ? AND buyer_id = b.id AND reveal_type = 'email'
+          ) AS email_revealed
+        FROM buyers b
+        ${whereClause}
+        ORDER BY b.buyer_date DESC, b.id DESC
+        LIMIT ? OFFSET ?
+      `;
+      [rows] = await pool.query(sql, [sellerId, sellerId, ...values, limit, offset]);
+    } else {
+      const sql = `
+        SELECT
+          b.id AS id, b.buyer_date, b.product, b.hsn_code, b.country,
+          b.company_name, b.website,
+          1 AS phone_revealed,
+          1 AS email_revealed
+        FROM buyers b
+        ${whereClause}
+        ORDER BY b.buyer_date DESC, b.id DESC
+        LIMIT ? OFFSET ?
+      `;
+      [rows] = await pool.query(sql, [...values, limit, offset]);
+    }
+
+    const revealedPhoneIds = rows.filter(r => r.phone_revealed).map(r => r.id);
+    const revealedEmailIds = rows.filter(r => r.email_revealed).map(r => r.id);
+
+    let contactsMap = {};
+    let emailsMap = {};
+
+    if (revealedPhoneIds.length) {
+      const [contactRows] = await pool.query(
+        `SELECT buyer_id, GROUP_CONCAT(DISTINCT contact_number SEPARATOR ', ') AS contacts
+         FROM buyer_contacts WHERE buyer_id IN (?) GROUP BY buyer_id`,
+        [revealedPhoneIds]
+      );
+      contactsMap = Object.fromEntries(contactRows.map(r => [r.buyer_id, r.contacts]));
+    }
+
+    if (revealedEmailIds.length) {
+      const [emailRows] = await pool.query(
+        `SELECT buyer_id, GROUP_CONCAT(DISTINCT email SEPARATOR ', ') AS emails
+         FROM buyer_emails WHERE buyer_id IN (?) GROUP BY buyer_id`,
+        [revealedEmailIds]
+      );
+      emailsMap = Object.fromEntries(emailRows.map(r => [r.buyer_id, r.emails]));
+    }
+
+    const data = rows.map(r => ({
+      ...r,
+      contacts: r.phone_revealed ? (contactsMap[r.id] || null) : null,
+      emails:   r.email_revealed ? (emailsMap[r.id]   || null) : null,
+    }));
+
+    res.json({
+      success: true,
+      data,
+      total,
+      offset,
+      limit,
+      has_more: offset + rows.length < total,
+    });
+  } catch (err) {
+    console.error('GET /buyers error', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ============================================================
+// 1) GET /buyers/count  -> total buyers matching filters only
+// ============================================================
+app.get('/buyers/count', async (req, res) => {
+  const pool = req.app.get('pool');
+  try {
+    const search  = req.query.search  || "";
+    const country = req.query.country || "";
+    const product = req.query.product || "";
+
+    let where = [];
+    let values = [];
+
+    if (search) {
+      where.push(`(
+        b.company_name LIKE ? OR b.country LIKE ? OR b.product LIKE ?
+        OR b.hsn_code LIKE ? OR b.website LIKE ?
+      )`);
+      values.push(`%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`);
+    }
+    if (country) { where.push("b.country = ?"); values.push(country); }
+    if (product) { where.push("b.product = ?"); values.push(product); }
+
+    const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+
+    const [rows] = await pool.query(
+      `SELECT COUNT(*) AS total FROM buyers b ${whereClause}`,
+      values
+    );
+
+    res.json({
+      success: true,
+      total: rows[0].total,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+
+// ============================================================
+// GET /buyers/:id  — View single buyer with contacts + emails
+// ============================================================
+app.get('/buyers/:id', async (req, res) => {
+  const pool = req.app.get('pool');
+  try {
+    const buyerId = Number(req.params.id);
+    if (!buyerId) {
+      return res.status(400).json({ success: false, error: 'Invalid buyer id' });
+    }
+
+    const [[buyer]] = await pool.query(
+      `SELECT * FROM buyers WHERE id = ? LIMIT 1`,
+      [buyerId]
+    );
+
+    if (!buyer) {
+      return res.status(404).json({ success: false, error: 'Buyer not found' });
+    }
+
+    const [contacts] = await pool.query(
+      `SELECT id, contact_number FROM buyer_contacts WHERE buyer_id = ?`,
+      [buyerId]
+    );
+
+    const [emails] = await pool.query(
+      `SELECT id, email FROM buyer_emails WHERE buyer_id = ?`,
+      [buyerId]
+    );
+
+    res.json({
+      success: true,
+      data: {
+        ...buyer,
+        contacts,
+        emails,
+      },
+    });
+  } catch (err) {
+    console.error('GET /buyers/:id error', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ============================================================
+// PUT /buyers/:id  — Update buyer + replace contacts/emails
+// ============================================================
+app.put('/buyers/:id', async (req, res) => {
+  const pool = req.app.get('pool');
+  const conn = await pool.getConnection();
+  try {
+    const buyerId = Number(req.params.id);
+    if (!buyerId) {
+      return res.status(400).json({ success: false, error: 'Invalid buyer id' });
+    }
+
+    const {
+      product,
+      hsn_code,
+      country,
+      company_name,
+      website,
+      address,
+      additional_details,
+      suggested_keywords,
+      hsn_descriptions,
+      confidence_level,
+      reason,
+      classification_notes,
+      manual_verification,
+      buyer_date,
+      contacts = [],   // array of strings
+      emails = [],     // array of strings
+    } = req.body;
+
+    await conn.beginTransaction();
+
+    // ---- update buyers row ----
+    const [updateResult] = await conn.query(
+      `UPDATE buyers SET
+         product = ?,
+         hsn_code = ?,
+         country = ?,
+         company_name = ?,
+         website = ?,
+         address = ?,
+         additional_details = ?,
+         suggested_keywords = ?,
+         hsn_descriptions = ?,
+         confidence_level = ?,
+         reason = ?,
+         classification_notes = ?,
+         manual_verification = ?,
+         buyer_date = ?
+       WHERE id = ?`,
+      [
+        product ?? null,
+        hsn_code ?? null,
+        country ?? null,
+        company_name ?? null,
+        website ?? null,
+        address ?? null,
+        additional_details ?? null,
+        suggested_keywords ?? null,
+        hsn_descriptions ?? null,
+        confidence_level ?? null,
+        reason ?? null,
+        classification_notes ?? null,
+        manual_verification ?? null,
+        buyer_date ?? null,
+        buyerId,
+      ]
+    );
+
+    if (updateResult.affectedRows === 0) {
+      await conn.rollback();
+      return res.status(404).json({ success: false, error: 'Buyer not found' });
+    }
+
+    // ---- replace contacts (only if provided in body) ----
+    if (Array.isArray(contacts)) {
+      await conn.query(`DELETE FROM buyer_contacts WHERE buyer_id = ?`, [buyerId]);
+      const cleaned = contacts.map((c) => (c || '').trim()).filter(Boolean);
+      if (cleaned.length) {
+        const values = cleaned.map((c) => [buyerId, c]);
+        await conn.query(
+          `INSERT INTO buyer_contacts (buyer_id, contact_number) VALUES ?`,
+          [values]
+        );
+      }
+    }
+
+    // ---- replace emails (only if provided in body) ----
+    if (Array.isArray(emails)) {
+      await conn.query(`DELETE FROM buyer_emails WHERE buyer_id = ?`, [buyerId]);
+      const cleaned = emails.map((e) => (e || '').trim()).filter(Boolean);
+      if (cleaned.length) {
+        const values = cleaned.map((e) => [buyerId, e]);
+        await conn.query(
+          `INSERT INTO buyer_emails (buyer_id, email) VALUES ?`,
+          [values]
+        );
+      }
+    }
+
+    await conn.commit();
+    res.json({ success: true, message: 'Buyer updated successfully' });
+  } catch (err) {
+    await conn.rollback();
+    console.error('PUT /buyers/:id error', err);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
+// ============================================================
+// DELETE /buyers/:id  — Delete buyer + cascade contacts/emails
+// ============================================================
+app.delete('/buyers/:id', async (req, res) => {
+  const pool = req.app.get('pool');
+  const conn = await pool.getConnection();
+  try {
+    const buyerId = Number(req.params.id);
+    if (!buyerId) {
+      return res.status(400).json({ success: false, error: 'Invalid buyer id' });
+    }
+
+    await conn.beginTransaction();
+
+    await conn.query(`DELETE FROM buyer_contacts WHERE buyer_id = ?`, [buyerId]);
+    await conn.query(`DELETE FROM buyer_emails WHERE buyer_id = ?`, [buyerId]);
+    const [result] = await conn.query(`DELETE FROM buyers WHERE id = ?`, [buyerId]);
+
+    if (result.affectedRows === 0) {
+      await conn.rollback();
+      return res.status(404).json({ success: false, error: 'Buyer not found' });
+    }
+
+    await conn.commit();
+    res.json({ success: true, message: 'Buyer deleted successfully' });
+  } catch (err) {
+    await conn.rollback();
+    console.error('DELETE /buyers/:id error', err);
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    conn.release();
+  }
+});
+app.get('/dashboard/buyers-analytics', async (req, res) => {
+  const pool = req.app.get('pool');
+  try {
+    const search  = req.query.search  || "";
+    const country = req.query.country || "";
+    const product = req.query.product || "";
+    const year    = req.query.year    || "";
+    const from    = req.query.from    || "";
+    const to      = req.query.to      || "";
+
+    let where = [];
+    let values = [];
+
+    // ---- date filtering on buyer_date ----
+    if (year && /^\d{4}$/.test(String(year))) {
+      where.push("YEAR(b.buyer_date) = ?");
+      values.push(Number(year));
+    } else if (from && to) {
+      where.push("b.buyer_date >= ? AND b.buyer_date <= ?");
+      values.push(`${from} 00:00:00`, `${to} 23:59:59`);
+    } else if (from) {
+      where.push("b.buyer_date >= ?");
+      values.push(`${from} 00:00:00`);
+    } else if (to) {
+      where.push("b.buyer_date <= ?");
+      values.push(`${to} 23:59:59`);
+    }
+
+    // ---- text / field filters ----
+    if (search) {
+      where.push(`(
+        b.company_name LIKE ? OR b.country LIKE ? OR b.product LIKE ?
+        OR b.hsn_code LIKE ? OR b.website LIKE ?
+      )`);
+      values.push(`%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`);
+    }
+    if (country) { where.push("b.country = ?"); values.push(country); }
+    if (product) { where.push("b.product = ?"); values.push(product); }
+
+    const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+
+    // ---- 1. Overall totals ----
+    const [[totals]] = await pool.query(
+      `SELECT COUNT(*) AS total_buyers FROM buyers b ${whereClause}`,
+      values
+    );
+
+    // ---- 2. Monthly buyers (for bar chart) ----
+    const [monthlyRows] = await pool.query(
+      `SELECT
+         DATE_FORMAT(b.buyer_date, '%b') AS month,
+         MONTH(b.buyer_date) AS month_num,
+         COUNT(*) AS buyers
+       FROM buyers b
+       ${whereClause}
+       GROUP BY MONTH(b.buyer_date), DATE_FORMAT(b.buyer_date, '%b')
+       ORDER BY month_num`,
+      values
+    );
+
+    // ---- 3. Buyer share by product/category (for pie chart) ----
+    const [productShareRows] = await pool.query(
+      `SELECT
+         COALESCE(NULLIF(b.product, ''), 'Others') AS name,
+         COUNT(*) AS value
+       FROM buyers b
+       ${whereClause}
+       GROUP BY name
+       ORDER BY value DESC
+       LIMIT 5`,
+      values
+    );
+
+    // ---- 4. Buyer share by country (extra, useful for dashboard) ----
+    const [countryShareRows] = await pool.query(
+      `SELECT
+         COALESCE(NULLIF(b.country, ''), 'Unknown') AS name,
+         COUNT(*) AS value
+       FROM buyers b
+       ${whereClause}
+       GROUP BY name
+       ORDER BY value DESC
+       LIMIT 5`,
+      values
+    );
+
+    // ---- 5. Annual overview (total buyers + avg per month) ----
+    const totalBuyers = totals.total_buyers;
+    const monthCount  = monthlyRows.length || 1;
+
+    res.json({
+      success: true,
+      filters: { search, country, product, year, from, to },
+      totals: {
+        total_buyers: totalBuyers,
+        avg_buyers_per_month: Math.round(totalBuyers / monthCount),
+      },
+      monthly: monthlyRows.map(r => ({ month: r.month, buyers: r.buyers })),
+      product_share: productShareRows,
+      country_share: countryShareRows,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+
+app.get("/users/stats", async (req, res) => {
+  try {
+    const [[totals]] = await pool.query(`
+      SELECT
+        COUNT(*)                                          AS total_users,
+        SUM(CASE WHEN email_sent   = 1 THEN 1 ELSE 0 END) AS email_sent_count,
+        SUM(CASE WHEN email_config = 1 THEN 1 ELSE 0 END) AS email_config_count
+      FROM users
+    `);
+
+    // Role breakdown (admin / seller / user counts)
+    const [roleRows] = await pool.query(`
+      SELECT role, COUNT(*) AS count
+      FROM users
+      GROUP BY role
+    `);
+
+    const roleBreakdown = roleRows.reduce((acc, r) => {
+      acc[r.role] = r.count;
+      return acc;
+    }, {});
+
+    res.json({
+      success: true,
+      total_users: Number(totals.total_users) || 0,
+      email_sent_count: Number(totals.email_sent_count) || 0,
+      email_config_count: Number(totals.email_config_count) || 0,
+      role_breakdown: roleBreakdown,
+    });
+  } catch (error) {
+    console.error("Error fetching user stats:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch user stats",
+      error: error.message,
+    });
+  }
+});
 
 app.use('/', buyerRoutes);
 app.use('/', bulkBuyerRoutes);

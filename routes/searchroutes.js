@@ -12,6 +12,7 @@ function generateUUID() {
   });
 }
 
+
 // Store response endpoint
 router.post('/api/store-response', async (req, res) => {
   const pool = req.app.get('pool');
@@ -708,5 +709,7 @@ router.get("/buyers/:id", async (req, res) => {
     res.status(500).json({ success: false, error: err.message });
   }
 });
+
+
 
 module.exports = router;

@@ -9,6 +9,7 @@ const pool = mysql.createPool({
   waitForConnections: true,
   connectionLimit: 10,
   // port:4306
+   dateStrings: true, 
 });
 
 module.exports = pool;
