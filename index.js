@@ -816,48 +816,47 @@ app.get("/api/package/:sellerId", async (req, res) => {
 app.get('/buyersnew', async (req, res) => {
   const pool = req.app.get('pool');
   try {
-    // ---------- SAFE seller_id parsing ----------
     const rawSeller = req.query.seller_id;
     const parsedSeller = Number(rawSeller);
     const sellerId =
-      rawSeller !== undefined &&
-      rawSeller !== '' &&
-      Number.isFinite(parsedSeller) &&
-      parsedSeller > 0
-        ? parsedSeller
-        : null;
+      rawSeller !== undefined && rawSeller !== '' &&
+      Number.isFinite(parsedSeller) && parsedSeller > 0
+        ? parsedSeller : null;
 
     const limit  = Math.min(Number(req.query.limit  || 50), 100);
     const offset = Number(req.query.offset || 0);
-    const search  = req.query.search  || "";
-    const country = req.query.country || "";
-    const product = req.query.product || "";
+    const search  = (req.query.search  || "").trim();
+    const country = (req.query.country || "").trim();
+    const product = (req.query.product || "").trim();
 
     let where = [];
     let values = [];
 
     if (search) {
+      const like = `${search}%`;
       where.push(`(
         b.company_name LIKE ? OR b.country LIKE ? OR b.product LIKE ?
         OR b.hsn_code LIKE ? OR b.website LIKE ?
         OR EXISTS (SELECT 1 FROM buyer_emails  be WHERE be.buyer_id = b.id AND be.email          LIKE ?)
         OR EXISTS (SELECT 1 FROM buyer_contacts bc WHERE bc.buyer_id = b.id AND bc.contact_number LIKE ?)
       )`);
-      values.push(
-        `%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`,
-        `%${search}%`, `%${search}%`
-      );
+      values.push(like, like, like, like, like, like, like);
     }
     if (country) { where.push("b.country = ?"); values.push(country); }
     if (product) { where.push("b.product = ?"); values.push(product); }
 
-    const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+    const whereClause = where.length ? `WHERE ${where.join(" AND ")}` : "";
 
-    const [countRows] = await pool.query(
-      `SELECT COUNT(*) AS total FROM buyers b ${whereClause}`,
-      values
-    );
-    const total = countRows[0].total;
+    // count only on first page
+    let total;
+    if (offset === 0) {
+      const [countRows] = await pool.query(
+        `SELECT COUNT(*) AS total FROM buyers b ${whereClause}`, values
+      );
+      total = countRows[0].total;
+    } else {
+      total = 0;
+    }
 
     let rows;
 
@@ -866,27 +865,23 @@ app.get('/buyersnew', async (req, res) => {
         SELECT
           b.id AS id, b.buyer_date, b.product, b.hsn_code, b.country,
           b.company_name, b.website,
-          EXISTS(
-            SELECT 1 FROM contact_reveal_history
-            WHERE seller_id = ? AND buyer_id = b.id AND reveal_type = 'phone'
-          ) AS phone_revealed,
-          EXISTS(
-            SELECT 1 FROM contact_reveal_history
-            WHERE seller_id = ? AND buyer_id = b.id AND reveal_type = 'email'
-          ) AS email_revealed
+          MAX(CASE WHEN crh.reveal_type = 'phone' THEN 1 ELSE 0 END) AS phone_revealed,
+          MAX(CASE WHEN crh.reveal_type = 'email' THEN 1 ELSE 0 END) AS email_revealed
         FROM buyers b
+        LEFT JOIN contact_reveal_history crh
+          ON crh.buyer_id = b.id AND crh.seller_id = ?
         ${whereClause}
+        GROUP BY b.id
         ORDER BY b.buyer_date DESC, b.id DESC
         LIMIT ? OFFSET ?
       `;
-      [rows] = await pool.query(sql, [sellerId, sellerId, ...values, limit, offset]);
+      [rows] = await pool.query(sql, [sellerId, ...values, limit, offset]);
     } else {
       const sql = `
         SELECT
           b.id AS id, b.buyer_date, b.product, b.hsn_code, b.country,
           b.company_name, b.website,
-          1 AS phone_revealed,
-          1 AS email_revealed
+          1 AS phone_revealed, 1 AS email_revealed
         FROM buyers b
         ${whereClause}
         ORDER BY b.buyer_date DESC, b.id DESC
@@ -898,26 +893,23 @@ app.get('/buyersnew', async (req, res) => {
     const revealedPhoneIds = rows.filter(r => r.phone_revealed).map(r => r.id);
     const revealedEmailIds = rows.filter(r => r.email_revealed).map(r => r.id);
 
-    let contactsMap = {};
-    let emailsMap = {};
+    const [contactsRes, emailsRes] = await Promise.all([
+      revealedPhoneIds.length
+        ? pool.query(
+            `SELECT buyer_id, GROUP_CONCAT(DISTINCT contact_number SEPARATOR ', ') AS contacts
+             FROM buyer_contacts WHERE buyer_id IN (?) GROUP BY buyer_id`,
+            [revealedPhoneIds])
+        : Promise.resolve([[]]),
+      revealedEmailIds.length
+        ? pool.query(
+            `SELECT buyer_id, GROUP_CONCAT(DISTINCT email SEPARATOR ', ') AS emails
+             FROM buyer_emails WHERE buyer_id IN (?) GROUP BY buyer_id`,
+            [revealedEmailIds])
+        : Promise.resolve([[]]),
+    ]);
 
-    if (revealedPhoneIds.length) {
-      const [contactRows] = await pool.query(
-        `SELECT buyer_id, GROUP_CONCAT(DISTINCT contact_number SEPARATOR ', ') AS contacts
-         FROM buyer_contacts WHERE buyer_id IN (?) GROUP BY buyer_id`,
-        [revealedPhoneIds]
-      );
-      contactsMap = Object.fromEntries(contactRows.map(r => [r.buyer_id, r.contacts]));
-    }
-
-    if (revealedEmailIds.length) {
-      const [emailRows] = await pool.query(
-        `SELECT buyer_id, GROUP_CONCAT(DISTINCT email SEPARATOR ', ') AS emails
-         FROM buyer_emails WHERE buyer_id IN (?) GROUP BY buyer_id`,
-        [revealedEmailIds]
-      );
-      emailsMap = Object.fromEntries(emailRows.map(r => [r.buyer_id, r.emails]));
-    }
+    const contactsMap = Object.fromEntries(contactsRes[0].map(r => [r.buyer_id, r.contacts]));
+    const emailsMap   = Object.fromEntries(emailsRes[0].map(r   => [r.buyer_id, r.emails]));
 
     const data = rows.map(r => ({
       ...r,
@@ -926,22 +918,61 @@ app.get('/buyersnew', async (req, res) => {
     }));
 
     res.json({
-      success: true,
-      data,
-      total,
-      offset,
-      limit,
+      success: true, data, total, offset, limit,
       has_more: offset + rows.length < total,
     });
   } catch (err) {
-    console.error('GET /buyers error', err);
+    console.error('GET /buyersnew error', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+app.get('/buyers/latest', async (req, res) => {
+  const pool = req.app.get('pool');
+  try {
+    const limit = Math.min(Number(req.query.limit || 5), 20);
+
+    const [rows] = await pool.query(
+      `SELECT b.id, b.company_name, b.product, b.hsn_code, b.country
+       FROM buyers b
+       ORDER BY b.buyer_date DESC, b.id DESC
+       LIMIT ?`,
+      [limit]
+    );
+
+    const ids = rows.map(r => r.id);
+    if (!ids.length) {
+      return res.json({ success: true, data: [] });
+    }
+
+    const [contactsRes, emailsRes] = await Promise.all([
+      pool.query(
+        `SELECT buyer_id, GROUP_CONCAT(DISTINCT contact_number SEPARATOR ', ') AS contacts
+         FROM buyer_contacts WHERE buyer_id IN (?) GROUP BY buyer_id`,
+        [ids]
+      ),
+      pool.query(
+        `SELECT buyer_id, GROUP_CONCAT(DISTINCT email SEPARATOR ', ') AS emails
+         FROM buyer_emails WHERE buyer_id IN (?) GROUP BY buyer_id`,
+        [ids]
+      ),
+    ]);
+
+    const contactsMap = Object.fromEntries(contactsRes[0].map(r => [r.buyer_id, r.contacts]));
+    const emailsMap   = Object.fromEntries(emailsRes[0].map(r   => [r.buyer_id, r.emails]));
+
+    const data = rows.map(r => ({
+      ...r,
+      contacts: contactsMap[r.id] || null,
+      emails:   emailsMap[r.id]   || null,
+    }));
+
+    res.json({ success: true, data });
+  } catch (err) {
+    console.error('GET /buyers/latest error', err);
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// ============================================================
-// 1) GET /buyers/count  -> total buyers matching filters only
-// ============================================================
 app.get('/buyers/count', async (req, res) => {
   const pool = req.app.get('pool');
   try {
@@ -980,9 +1011,6 @@ app.get('/buyers/count', async (req, res) => {
 });
 
 
-// ============================================================
-// GET /buyers/:id  — View single buyer with contacts + emails
-// ============================================================
 app.get('/buyers/:id', async (req, res) => {
   const pool = req.app.get('pool');
   try {
@@ -1024,9 +1052,7 @@ app.get('/buyers/:id', async (req, res) => {
   }
 });
 
-// ============================================================
-// PUT /buyers/:id  — Update buyer + replace contacts/emails
-// ============================================================
+
 app.put('/buyers/:id', async (req, res) => {
   const pool = req.app.get('pool');
   const conn = await pool.getConnection();
@@ -1057,7 +1083,6 @@ app.put('/buyers/:id', async (req, res) => {
 
     await conn.beginTransaction();
 
-    // ---- update buyers row ----
     const [updateResult] = await conn.query(
       `UPDATE buyers SET
          product = ?,
@@ -1136,9 +1161,7 @@ app.put('/buyers/:id', async (req, res) => {
   }
 });
 
-// ============================================================
-// DELETE /buyers/:id  — Delete buyer + cascade contacts/emails
-// ============================================================
+
 app.delete('/buyers/:id', async (req, res) => {
   const pool = req.app.get('pool');
   const conn = await pool.getConnection();
@@ -1169,94 +1192,71 @@ app.delete('/buyers/:id', async (req, res) => {
     conn.release();
   }
 });
+
+
 app.get('/dashboard/buyers-analytics', async (req, res) => {
   const pool = req.app.get('pool');
   try {
-    const search  = req.query.search  || "";
-    const country = req.query.country || "";
-    const product = req.query.product || "";
-    const year    = req.query.year    || "";
-    const from    = req.query.from    || "";
-    const to      = req.query.to      || "";
+    const search  = (req.query.search  || "").trim();
+    const country = (req.query.country || "").trim();
+    const product = (req.query.product || "").trim();
+    const year    = req.query.year || "";
+    const from    = req.query.from || "";
+    const to      = req.query.to   || "";
 
     let where = [];
     let values = [];
 
-    // ---- date filtering on buyer_date ----
     if (year && /^\d{4}$/.test(String(year))) {
-      where.push("YEAR(b.buyer_date) = ?");
-      values.push(Number(year));
+      where.push("b.buyer_date >= ? AND b.buyer_date < ?");
+      values.push(`${year}-01-01`, `${Number(year) + 1}-01-01`);
     } else if (from && to) {
       where.push("b.buyer_date >= ? AND b.buyer_date <= ?");
-      values.push(`${from} 00:00:00`, `${to} 23:59:59`);
+      values.push(from, to);
     } else if (from) {
-      where.push("b.buyer_date >= ?");
-      values.push(`${from} 00:00:00`);
+      where.push("b.buyer_date >= ?"); values.push(from);
     } else if (to) {
-      where.push("b.buyer_date <= ?");
-      values.push(`${to} 23:59:59`);
+      where.push("b.buyer_date <= ?"); values.push(to);
     }
 
-    // ---- text / field filters ----
     if (search) {
+      const like = `${search}%`;
       where.push(`(
         b.company_name LIKE ? OR b.country LIKE ? OR b.product LIKE ?
         OR b.hsn_code LIKE ? OR b.website LIKE ?
       )`);
-      values.push(`%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`);
+      values.push(like, like, like, like, like);
     }
     if (country) { where.push("b.country = ?"); values.push(country); }
     if (product) { where.push("b.product = ?"); values.push(product); }
 
-    const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+    const whereClause = where.length ? `WHERE ${where.join(" AND ")}` : "";
 
-    // ---- 1. Overall totals ----
-    const [[totals]] = await pool.query(
-      `SELECT COUNT(*) AS total_buyers FROM buyers b ${whereClause}`,
-      values
-    );
+    const [
+      [totalsRows],
+      [monthlyRows],
+      [productShareRows],
+      [countryShareRows],
+    ] = await Promise.all([
+      pool.query(`SELECT COUNT(*) AS total_buyers FROM buyers b ${whereClause}`, values),
+      pool.query(
+        `SELECT DATE_FORMAT(b.buyer_date, '%b') AS month,
+                MONTH(b.buyer_date) AS month_num,
+                COUNT(*) AS buyers
+         FROM buyers b ${whereClause}
+         GROUP BY MONTH(b.buyer_date), DATE_FORMAT(b.buyer_date, '%b')
+         ORDER BY month_num`, values),
+      pool.query(
+        `SELECT COALESCE(NULLIF(b.product,''),'Others') AS name, COUNT(*) AS value
+         FROM buyers b ${whereClause}
+         GROUP BY name ORDER BY value DESC LIMIT 5`, values),
+      pool.query(
+        `SELECT COALESCE(NULLIF(b.country,''),'Unknown') AS name, COUNT(*) AS value
+         FROM buyers b ${whereClause}
+         GROUP BY name ORDER BY value DESC LIMIT 5`, values),
+    ]);
 
-    // ---- 2. Monthly buyers (for bar chart) ----
-    const [monthlyRows] = await pool.query(
-      `SELECT
-         DATE_FORMAT(b.buyer_date, '%b') AS month,
-         MONTH(b.buyer_date) AS month_num,
-         COUNT(*) AS buyers
-       FROM buyers b
-       ${whereClause}
-       GROUP BY MONTH(b.buyer_date), DATE_FORMAT(b.buyer_date, '%b')
-       ORDER BY month_num`,
-      values
-    );
-
-    // ---- 3. Buyer share by product/category (for pie chart) ----
-    const [productShareRows] = await pool.query(
-      `SELECT
-         COALESCE(NULLIF(b.product, ''), 'Others') AS name,
-         COUNT(*) AS value
-       FROM buyers b
-       ${whereClause}
-       GROUP BY name
-       ORDER BY value DESC
-       LIMIT 5`,
-      values
-    );
-
-    // ---- 4. Buyer share by country (extra, useful for dashboard) ----
-    const [countryShareRows] = await pool.query(
-      `SELECT
-         COALESCE(NULLIF(b.country, ''), 'Unknown') AS name,
-         COUNT(*) AS value
-       FROM buyers b
-       ${whereClause}
-       GROUP BY name
-       ORDER BY value DESC
-       LIMIT 5`,
-      values
-    );
-
-    // ---- 5. Annual overview (total buyers + avg per month) ----
-    const totalBuyers = totals.total_buyers;
+    const totalBuyers = totalsRows[0].total_buyers;
     const monthCount  = monthlyRows.length || 1;
 
     res.json({
