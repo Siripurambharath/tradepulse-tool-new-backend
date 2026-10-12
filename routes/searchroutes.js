@@ -399,64 +399,61 @@ router.post('/buyers/:id/reveal-contact', async (req, res) => {
 
     const localSeller = localSellerRows[0];
 
-    // ==========================================
-    // 8. Check Already Revealed
-    // ==========================================
-    const [existing] = await conn.query(
-      `SELECT 1
-       FROM contact_reveal_history
-       WHERE seller_id = ?
-         AND buyer_id = ?
-         AND reveal_type = ?
-       LIMIT 1`,
-      [sellerId, buyerId, reveal_type]
-    );
+  // ==========================================
+// 8. Check Already Revealed
+// ==========================================
+const [existing] = await conn.query(
+  `SELECT 1
+   FROM contact_reveal_history
+   WHERE seller_id = ?
+     AND buyer_id = ?
+     AND reveal_type = ?
+   LIMIT 1`,
+  [sellerId, buyerId, reveal_type]
+);
 
-    const alreadyRevealed = existing.length > 0;
+const alreadyRevealed = existing.length > 0;
 
-    // ==========================================
-    // 9. If New Reveal, Check Limit
-    // ==========================================
-    if (!alreadyRevealed) {
-      const usedField =
-        reveal_type === 'phone'
-          ? 'phone_used'
-          : 'email_used';
+// ==========================================
+// 9. If New Reveal, Check Limit
+// ==========================================
+const usedField = reveal_type === 'phone' ? 'phone_used' : 'email_used';
+const used = Number(localSeller[usedField] || 0);
 
-      const used = Number(localSeller[usedField] || 0);
+if (!alreadyRevealed) {
+  if (!isUnlimited && used >= Number(buyerContactLimit)) {
+    await conn.rollback();
 
-      if (!isUnlimited && used >= Number(buyerContactLimit)) {
-        await conn.rollback();
+    return res.status(403).json({
+      success: false,
+      error: 'LIMIT_REACHED',
+      message: `You've reached your ${reveal_type} reveal limit (${used}/${buyerContactLimit}).`,
+    });
+  }
+}
 
-        return res.status(403).json({
-          success: false,
-          error: 'LIMIT_REACHED',
-          message: `You've reached your ${reveal_type} reveal limit (${used}/${buyerContactLimit}).`,
-        });
-      }
+// ==========================================
+// 10. ALWAYS Save Reveal History + Increment Count
+//     (runs on EVERY click, not just first)
+// ==========================================
+await conn.query(
+  `INSERT INTO contact_reveal_history
+    (
+      seller_id,
+      buyer_id,
+      reveal_type,
+      revealed_at
+    )
+   VALUES (?, ?, ?, NOW())`,
+  [sellerId, buyerId, reveal_type]
+);
 
-      // ==========================================
-      // 10. Save Reveal History
-      // ==========================================
-      await conn.query(
-        `INSERT INTO contact_reveal_history
-          (
-            seller_id,
-            buyer_id,
-            reveal_type,
-            revealed_at
-          )
-         VALUES (?, ?, ?, NOW())`,
-        [sellerId, buyerId, reveal_type]
-      );
-
-   await conn.query(
+await conn.query(
   `UPDATE users
    SET ${usedField} = ${usedField} + 1
    WHERE id = ?`,
   [sellerId]
 );
-    }
 
     // ==========================================
     // 12. Get Buyer Contact Details

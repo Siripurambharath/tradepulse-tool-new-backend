@@ -337,6 +337,8 @@ router.delete('/buyers/:id', async (req, res) => {
 
 // ══════════════════════════════════════════════
 // GET /dashboard/buyers-analytics
+// Shows ALL 12 months (Jan–Dec) always
+// Includes real monthly users from `users` table
 // ══════════════════════════════════════════════
 router.get('/dashboard/buyers-analytics', async (req, res) => {
   const pool = req.app.get('pool');
@@ -348,6 +350,8 @@ router.get('/dashboard/buyers-analytics', async (req, res) => {
     const from    = req.query.from || "";
     const to      = req.query.to   || "";
 
+    const effectiveYear = year || new Date().getFullYear();
+
     let where = [];
     let values = [];
 
@@ -357,10 +361,9 @@ router.get('/dashboard/buyers-analytics', async (req, res) => {
     } else if (from && to) {
       where.push("b.buyer_date >= ? AND b.buyer_date <= ?");
       values.push(from, to);
-    } else if (from) {
-      where.push("b.buyer_date >= ?"); values.push(from);
-    } else if (to) {
-      where.push("b.buyer_date <= ?"); values.push(to);
+    } else {
+      where.push("b.buyer_date >= ? AND b.buyer_date < ?");
+      values.push(`${effectiveYear}-01-01`, `${Number(effectiveYear) + 1}-01-01`);
     }
 
     if (search) {
@@ -376,46 +379,106 @@ router.get('/dashboard/buyers-analytics', async (req, res) => {
 
     const whereClause = where.length ? `WHERE ${where.join(" AND ")}` : "";
 
+    let userWhere = [];
+    let userValues = [];
+
+    if (year && /^\d{4}$/.test(String(year))) {
+      userWhere.push("u.created_at >= ? AND u.created_at < ?");
+      userValues.push(`${year}-01-01`, `${Number(year) + 1}-01-01`);
+    } else if (from && to) {
+      userWhere.push("u.created_at >= ? AND u.created_at < DATE_ADD(?, INTERVAL 1 DAY)");
+      userValues.push(from, to);
+    } else {
+      userWhere.push("u.created_at >= ? AND u.created_at < ?");
+      userValues.push(`${effectiveYear}-01-01`, `${Number(effectiveYear) + 1}-01-01`);
+    }
+
+    const userWhereClause = userWhere.length ? `WHERE ${userWhere.join(" AND ")}` : "";
+
     const [
       [totalsRows],
       [monthlyRows],
       [productShareRows],
       [countryShareRows],
+      [monthlyUsersRows],
+      [totalsUsersRows],
     ] = await Promise.all([
       pool.query(`SELECT COUNT(*) AS total_buyers FROM buyers b ${whereClause}`, values),
+
       pool.query(
-        `SELECT DATE_FORMAT(b.buyer_date, '%b') AS month,
-                MONTH(b.buyer_date) AS month_num,
-                COUNT(*) AS buyers
-         FROM buyers b ${whereClause}
-         GROUP BY MONTH(b.buyer_date), DATE_FORMAT(b.buyer_date, '%b')
-         ORDER BY month_num`, values),
+        `SELECT MONTH(b.buyer_date) AS month_num, COUNT(*) AS buyers
+         FROM buyers b
+         ${whereClause}
+         GROUP BY MONTH(b.buyer_date)
+         ORDER BY month_num`,
+        values
+      ),
+
       pool.query(
         `SELECT COALESCE(NULLIF(b.product,''),'Others') AS name, COUNT(*) AS value
          FROM buyers b ${whereClause}
-         GROUP BY name ORDER BY value DESC LIMIT 5`, values),
+         GROUP BY name ORDER BY value DESC LIMIT 5`,
+        values
+      ),
+
       pool.query(
         `SELECT COALESCE(NULLIF(b.country,''),'Unknown') AS name, COUNT(*) AS value
          FROM buyers b ${whereClause}
-         GROUP BY name ORDER BY value DESC LIMIT 5`, values),
+         GROUP BY name ORDER BY value DESC LIMIT 5`,
+        values
+      ),
+
+      pool.query(
+        `SELECT MONTH(u.created_at) AS month_num, COUNT(*) AS users
+         FROM users u
+         ${userWhereClause}
+         GROUP BY MONTH(u.created_at)
+         ORDER BY month_num`,
+        userValues
+      ),
+
+      pool.query(
+        `SELECT COUNT(*) AS total_users FROM users u ${userWhereClause}`,
+        userValues
+      ),
     ]);
 
-    const totalBuyers = totalsRows[0].total_buyers;
-    const monthCount  = monthlyRows.length || 1;
+    const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun',
+                         'Jul','Aug','Sep','Oct','Nov','Dec'];
+
+    const buyersByMonth = new Map();
+    monthlyRows.forEach(r => buyersByMonth.set(Number(r.month_num), Number(r.buyers)));
+
+    const usersByMonth = new Map();
+    monthlyUsersRows.forEach(r => usersByMonth.set(Number(r.month_num), Number(r.users)));
+
+    const monthly = MONTH_NAMES.map((name, idx) => ({
+      month: name,
+      buyers: buyersByMonth.get(idx + 1) || 0,
+      users:  usersByMonth.get(idx + 1)  || 0,
+    }));
+
+    const totalBuyers = Number(totalsRows[0].total_buyers) || 0;
+    const totalUsers  = Number(totalsUsersRows[0].total_users) || 0;
+
+    const monthsWithData = monthly.filter(m => m.buyers > 0).length || 1;
+    const avgBuyersPerMonth = Math.round(totalBuyers / monthsWithData);
 
     res.json({
       success: true,
       filters: { search, country, product, year, from, to },
       totals: {
         total_buyers: totalBuyers,
-        avg_buyers_per_month: Math.round(totalBuyers / monthCount),
+        avg_buyers_per_month: avgBuyersPerMonth,
+        total_users: totalUsers,
       },
-      monthly: monthlyRows.map(r => ({ month: r.month, buyers: r.buyers })),
+      monthly,
       product_share: productShareRows,
       country_share: countryShareRows,
     });
+
   } catch (err) {
-    console.error(err);
+    console.error('GET /dashboard/buyers-analytics error', err);
     res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -426,19 +489,42 @@ router.get('/dashboard/buyers-analytics', async (req, res) => {
 router.get('/users/stats', async (req, res) => {
   const pool = req.app.get('pool');
   try {
-    const [[totals]] = await pool.query(`
-      SELECT
-        COUNT(*)                                          AS total_users,
-        SUM(CASE WHEN email_sent   = 1 THEN 1 ELSE 0 END) AS email_sent_count,
-        SUM(CASE WHEN email_config = 1 THEN 1 ELSE 0 END) AS email_config_count
-      FROM users
-    `);
+    const from = req.query.from || "";
+    const to   = req.query.to   || "";
 
-    const [roleRows] = await pool.query(`
-      SELECT role, COUNT(*) AS count
-      FROM users
-      GROUP BY role
-    `);
+    let where = [];
+    let values = [];
+
+    if (from && to) {
+      where.push("created_at >= ? AND created_at < DATE_ADD(?, INTERVAL 1 DAY)");
+      values.push(from, to);
+    } else if (from) {
+      where.push("created_at >= ?");
+      values.push(from);
+    } else if (to) {
+      where.push("created_at < DATE_ADD(?, INTERVAL 1 DAY)");
+      values.push(to);
+    }
+
+    const whereClause = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+    const [[totals]] = await pool.query(
+      `SELECT
+         COUNT(*)                                          AS total_users,
+         SUM(CASE WHEN email_sent   = 1 THEN 1 ELSE 0 END) AS email_sent_count,
+         SUM(CASE WHEN email_config = 1 THEN 1 ELSE 0 END) AS email_config_count
+       FROM users
+       ${whereClause}`,
+      values
+    );
+
+    const [roleRows] = await pool.query(
+      `SELECT role, COUNT(*) AS count
+       FROM users
+       ${whereClause}
+       GROUP BY role`,
+      values
+    );
 
     const roleBreakdown = roleRows.reduce((acc, r) => {
       acc[r.role] = r.count;
@@ -482,9 +568,30 @@ router.get('/filters/products', async (req, res) => {
 router.get('/filters/buyer-countries', async (req, res) => {
   const pool = req.app.get('pool');
   try {
+    const product = (req.query.product || "").trim();
+    const from    = req.query.from || "";
+    const to      = req.query.to   || "";
+
+    let where = [`b.country IS NOT NULL`, `b.country <> ''`];
+    let values = [];
+
+    if (product) { where.push("b.product = ?"); values.push(product); }
+
+    if (from && to) {
+      where.push("b.buyer_date >= ? AND b.buyer_date <= ?");
+      values.push(from, to);
+    }
+
+    const whereClause = `WHERE ${where.join(" AND ")}`;
+
     const [rows] = await pool.query(
-      `SELECT DISTINCT country FROM buyers WHERE country IS NOT NULL AND country <> '' ORDER BY country`
+      `SELECT DISTINCT b.country
+       FROM buyers b
+       ${whereClause}
+       ORDER BY b.country`,
+      values
     );
+
     res.json(rows);
   } catch (err) {
     console.error('GET /filters/buyer-countries error', err);
