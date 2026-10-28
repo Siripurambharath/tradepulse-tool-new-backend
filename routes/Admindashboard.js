@@ -565,38 +565,76 @@ router.get('/filters/products', async (req, res) => {
   }
 });
 
-router.get('/filters/buyer-countries', async (req, res) => {
-  const pool = req.app.get('pool');
+
+const countries = require("i18n-iso-countries");
+const en = require("i18n-iso-countries/langs/en.json");
+
+countries.registerLocale(en);
+
+router.get("/filters/buyer-countries-admin", async (req, res) => {
+  const pool = req.app.get("pool");
+
   try {
     const product = (req.query.product || "").trim();
-    const from    = req.query.from || "";
-    const to      = req.query.to   || "";
+    const from = req.query.from || "";
+    const to = req.query.to || "";
 
-    let where = [`b.country IS NOT NULL`, `b.country <> ''`];
-    let values = [];
+    const where = [
+      "b.country IS NOT NULL",
+      "TRIM(b.country) <> ''"
+    ];
+    const values = [];
 
-    if (product) { where.push("b.product = ?"); values.push(product); }
+    if (product) {
+      where.push("b.product = ?");
+      values.push(product);
+    }
 
     if (from && to) {
       where.push("b.buyer_date >= ? AND b.buyer_date <= ?");
       values.push(from, to);
     }
 
-    const whereClause = `WHERE ${where.join(" AND ")}`;
-
     const [rows] = await pool.query(
-      `SELECT DISTINCT b.country
+      `SELECT DISTINCT TRIM(b.country) AS country
        FROM buyers b
-       ${whereClause}
-       ORDER BY b.country`,
+       WHERE ${where.join(" AND ")}
+       ORDER BY country`,
       values
     );
 
-    res.json(rows);
+    const uniqueCountries = new Map();
+
+    for (const row of rows) {
+      const name = row.country.trim();
+      const code = countries.getAlpha2Code(name, "en");
+
+      // Ignore unrecognized names and dummy/location values.
+      if (!code) continue;
+
+      const standardName = countries.getName(code, "en");
+
+      if (standardName && !uniqueCountries.has(code)) {
+        uniqueCountries.set(code, {
+          country: standardName
+        });
+      }
+    }
+
+    const result = [...uniqueCountries.values()].sort((a, b) =>
+      a.country.localeCompare(b.country)
+    );
+
+    return res.json(result);
   } catch (err) {
-    console.error('GET /filters/buyer-countries error', err);
-    res.status(500).json({ success: false, error: err.message });
+    console.error("GET /filters/buyer-countries-admin error:", err);
+
+    return res.status(500).json({
+      success: false,
+      error: "Failed to fetch buyer countries"
+    });
   }
 });
+
 
 module.exports = router;

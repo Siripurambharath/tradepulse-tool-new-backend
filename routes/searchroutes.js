@@ -618,20 +618,59 @@ router.get('/buyers', async (req, res) => {
   }
 });
 
-// Get buyer countries filter
+
+
+const countries = require("i18n-iso-countries");
+const en = require("i18n-iso-countries/langs/en.json");
+
+countries.registerLocale(en);
+
 router.get("/filters/buyer-countries", async (req, res) => {
-  const pool = req.app.get('pool');
+  const pool = req.app.get("pool");
+
   try {
     const [rows] = await pool.query(`
-      SELECT DISTINCT country FROM buyers
-      WHERE country IS NOT NULL AND country <> ''
+      SELECT DISTINCT TRIM(country) AS country
+      FROM buyers
+      WHERE country IS NOT NULL
+        AND TRIM(country) <> ''
       ORDER BY country
     `);
-    res.json(rows);
+
+    const uniqueCountries = new Map();
+
+    for (const row of rows) {
+      const name = row.country.trim();
+
+      // Convert recognized country names into standard country codes.
+      const code = countries.getAlpha2Code(name, "en");
+
+      if (!code) continue;
+
+      const standardName = countries.getName(code, "en");
+
+      if (standardName) {
+        uniqueCountries.set(code, {
+          country: standardName
+        });
+      }
+    }
+
+    const result = [...uniqueCountries.values()].sort((a, b) =>
+      a.country.localeCompare(b.country)
+    );
+
+    return res.status(200).json(result);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("Buyer countries API error:", err);
+
+    return res.status(500).json({
+      status: false,
+      message: "Failed to fetch buyer countries"
+    });
   }
 });
+
 
 // Get products filter
 router.get("/filters/products", async (req, res) => {
