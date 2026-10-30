@@ -526,9 +526,17 @@ router.get('/buyers', async (req, res) => {
   const pool = req.app.get('pool');
   try {
     const sellerId = Number(req.query.seller_id);
-    const limit = Math.min(Number(req.query.limit || 50), 100);
-    const offset = Number(req.query.offset || 0);
-    const search = req.query.search || "";
+    if (!Number.isFinite(sellerId) || sellerId <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'seller_id is required and must be a positive number',
+      });
+    }
+
+    const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 100);
+    const offset = Math.max(Number(req.query.offset) || 0, 0);
+
+    const search  = req.query.search  || "";
     const country = req.query.country || "";
     const product = req.query.product || "";
 
@@ -547,7 +555,6 @@ router.get('/buyers', async (req, res) => {
 
     const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
 
-    // Get total count for pagination UI
     const [countRows] = await pool.query(
       `SELECT COUNT(*) AS total FROM buyers b ${whereClause}`,
       values
@@ -565,14 +572,33 @@ router.get('/buyers', async (req, res) => {
         EXISTS(
           SELECT 1 FROM contact_reveal_history
           WHERE seller_id = ? AND buyer_id = b.id AND reveal_type = 'email'
-        ) AS email_revealed
+        ) AS email_revealed,
+        (
+          SELECT
+            CASE
+              WHEN SUM(e.response = 'interested') > 0 THEN 'interested'
+              WHEN SUM(e.response = 'not_interested') > 0 THEN 'not_interested'
+              WHEN SUM(e.reply_date IS NOT NULL OR e.responded_at IS NOT NULL) > 0 THEN 'replied'
+              ELSE NULL
+            END
+          FROM email_history_companies e
+          WHERE e.buyer_id = b.id AND e.seller_id = ?
+        ) AS response
       FROM buyers b
       ${whereClause}
       ORDER BY b.id DESC
       LIMIT ? OFFSET ?
     `;
 
-    const [rows] = await pool.query(sql, [sellerId, sellerId, ...values, limit, offset]);
+    // ⚠️ 3 sellerId placeholders — 2 for EXISTS, 1 for response subquery
+    const [rows] = await pool.query(sql, [
+      sellerId,
+      sellerId,
+      sellerId,
+      ...values,
+      limit,
+      offset,
+    ]);
 
     const revealedPhoneIds = rows.filter(r => r.phone_revealed).map(r => r.buyer_id);
     const revealedEmailIds = rows.filter(r => r.email_revealed).map(r => r.buyer_id);
@@ -602,12 +628,13 @@ router.get('/buyers', async (req, res) => {
       ...r,
       contacts: r.phone_revealed ? (contactsMap[r.buyer_id] || null) : null,
       emails: r.email_revealed ? (emailsMap[r.buyer_id] || null) : null,
+      response: r.response || null,   // ✅ ensures field always present
     }));
 
     res.json({
       success: true,
       data,
-      total,          // <-- frontend needs this
+      total,
       offset,
       limit,
       has_more: offset + rows.length < total,
@@ -671,17 +698,53 @@ router.get("/filters/buyer-countries", async (req, res) => {
   }
 });
 
-
-// Get products filter
-router.get("/filters/products", async (req, res) => {
+// routes/filters.js
+router.get("/filters/dropdown/products", async (req, res) => {
   const pool = req.app.get('pool');
   try {
-    const [rows] = await pool.query(`
-      SELECT DISTINCT product FROM buyers
-      WHERE product IS NOT NULL AND product <> ''
-      ORDER BY product
-    `);
-    res.json(rows);
+    const search = (req.query.search || '').trim();
+    const limit  = Math.min(Number(req.query.limit  || 50), 200);
+    const offset = Math.max(Number(req.query.offset || 0), 0);
+    const paginate = req.query.paginate !== 'false';
+
+    let where = `WHERE product IS NOT NULL AND product <> ''`;
+    const values = [];
+
+    if (search) {
+      where += ` AND product LIKE ?`;
+      values.push(`%${search}%`);
+    }
+
+    // ---- Full list (opt-in) ----
+    if (!paginate) {
+      const [rows] = await pool.query(
+        `SELECT DISTINCT product FROM buyers ${where} ORDER BY product`,
+        values
+      );
+      return res.json(rows); // plain array
+    }
+
+    // ---- Paginated mode (default) ----
+    const [countRows] = await pool.query(
+      `SELECT COUNT(DISTINCT product) AS total FROM buyers ${where}`,
+      values
+    );
+    const total = countRows[0]?.total || 0;
+
+    const [rows] = await pool.query(
+      `SELECT DISTINCT product FROM buyers ${where}
+       ORDER BY product
+       LIMIT ? OFFSET ?`,
+      [...values, limit, offset]
+    );
+
+    res.json({
+      data: rows,          
+      total,
+      limit,
+      offset,
+      has_more: offset + rows.length < total,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

@@ -19,19 +19,19 @@ router.get('/api/tracking/counts', async (req, res) => {
     const [results] = await pool.query(
       `
       SELECT 
-        (SELECT COUNT(DISTINCT buyer_id) FROM email_history_companies 
+        (SELECT COUNT(*) FROM email_history_companies 
          WHERE seller_id = ? AND status = 'sent') AS sent,
         
-        (SELECT COUNT(DISTINCT buyer_id) FROM email_history_companies 
+        (SELECT COUNT(*) FROM email_history_companies 
          WHERE seller_id = ? AND message IS NOT NULL AND message <> '' AND reply_date IS NOT NULL) AS replied,
         
-        (SELECT COUNT(DISTINCT buyer_id) FROM email_history_companies 
+        (SELECT COUNT(*) FROM email_history_companies 
          WHERE seller_id = ? AND response = 'interested') AS interested,
         
-        (SELECT COUNT(DISTINCT buyer_id) FROM email_history_companies 
+        (SELECT COUNT(*) FROM email_history_companies 
          WHERE seller_id = ? AND response = 'not_interested') AS not_interested,
         
-        (SELECT COUNT(DISTINCT buyer_id) FROM email_history_companies 
+        (SELECT COUNT(*) FROM email_history_companies 
          WHERE seller_id = ?) AS total_contacted
     `,
       [seller_id, seller_id, seller_id, seller_id, seller_id]
@@ -60,7 +60,7 @@ router.get('/api/tracking/counts', async (req, res) => {
   }
 });
 
-router.get('/api/tracking/page', async (req, res) => {
+router.get('/api/tracking/page/new', async (req, res) => {
   const pool = req.app.get('pool');
   const { seller_id, page = 1, limit = 10, search = '' } = req.query;
 
