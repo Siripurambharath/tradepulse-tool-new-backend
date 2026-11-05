@@ -12,29 +12,96 @@ function generateUUID() {
   });
 }
 
+// PUT: update existing response
+// PUT: create or update response (upsert)
 router.put('/api/store-response/:buyerId', async (req, res) => {
   const pool = req.app.get('pool');
   const { buyerId } = req.params;
-  const { response, seller_id } = req.body;
+  const {
+    response,
+    seller_id,
+    email,
+    companyName,
+    country,
+    contactName,
+    productName,
+    templateUsed,
+    hsn_code,
+  } = req.body;
 
-  if (!['interested','not_interested'].includes(response)) {
-    return res.status(400).json({ success:false, error:'Invalid response' });
+  // Validation
+  if (!response || !['interested', 'not_interested'].includes(response)) {
+    return res.status(400).json({
+      success: false,
+      error: 'Valid response (interested/not_interested) is required',
+    });
   }
 
   try {
-    const [result] = await pool.query(
+    // 1. Try to update the latest matching row
+    const [updateResult] = await pool.query(
       `UPDATE email_history_companies
        SET response = ?, responded_at = NOW(), status = 'responded'
        WHERE buyer_id = ? AND seller_id = ?
-       ORDER BY id DESC LIMIT 1`,
-      [response, buyerId, seller_id]
+       ORDER BY id DESC
+       LIMIT 1`,
+      [response, buyerId, seller_id || null]
     );
-    res.json({ success:true, updated: result.affectedRows });
-  } catch (e) {
-    res.status(500).json({ success:false, error: e.message });
+
+    let operation = 'UPDATE';
+    let id = null;
+
+    // 2. If nothing was updated, insert a new row
+    if (updateResult.affectedRows === 0) {
+      if (!email) {
+        return res.status(400).json({
+          success: false,
+          error: 'email is required when creating a new response',
+        });
+      }
+
+      operation = 'INSERT';
+      const batchId = generateUUID();
+      const yourEmail = process.env.EMAIL_USER;
+
+      const [insertResult] = await pool.query(
+        `INSERT INTO email_history_companies
+          (batch_id, buyer_id, seller_id, company_name, country, contact_name, email,
+           response, responded_at, product_name, template_used, status,
+           from_email, to_email, hsn_code)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?, 'responded', ?, ?, ?)`,
+        [
+          batchId,
+          buyerId,
+          seller_id || null,
+          companyName || null,
+          country || null,
+          contactName || null,
+          email,
+          response,
+          productName || null,
+          templateUsed || 'Manual Response',
+          email,
+          yourEmail,
+          hsn_code || null,
+        ]
+      );
+
+      id = insertResult.insertId;
+    }
+
+    return res.json({
+      success: true,
+      message: `${response === 'interested' ? 'Interested' : 'Not Interested'} ${
+        operation === 'UPDATE' ? 'updated' : 'recorded'
+      } successfully`,
+      data: { buyer_id: buyerId, response, operation, id },
+    });
+  } catch (error) {
+    console.error('Error storing response:', error);
+    return res.status(500).json({ success: false, error: error.message });
   }
 });
-
 
 // // Store response endpoint
 // router.post('/api/store-response', async (req, res) => {
