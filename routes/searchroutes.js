@@ -12,98 +12,121 @@ function generateUUID() {
   });
 }
 
-
-// Store response endpoint
-router.post('/api/store-response', async (req, res) => {
+router.put('/api/store-response/:buyerId', async (req, res) => {
   const pool = req.app.get('pool');
-  const { 
-    email, 
-    response, 
-    companyName, 
-    country, 
-    contactName, 
-    productName,
-    templateUsed,
-    buyer_id,
-    seller_id,
-    hsn_code  
-  } = req.body;
+  const { buyerId } = req.params;
+  const { response, seller_id } = req.body;
 
-  // Validation
-  if (!email || !response || !['interested', 'not_interested'].includes(response)) {
-    return res.status(400).json({ 
-      success: false, 
-      error: 'Email and valid response (interested/not_interested) are required' 
-    });
+  if (!['interested','not_interested'].includes(response)) {
+    return res.status(400).json({ success:false, error:'Invalid response' });
   }
 
   try {
-    const batchId = generateUUID();
-    const yourEmail = process.env.EMAIL_USER;
-    
-    const sellerId = seller_id || null;
-    
     const [result] = await pool.query(
-      `INSERT INTO email_history_companies 
-        (batch_id, buyer_id, seller_id, company_name, country, contact_name, email, 
-         response, responded_at, product_name, template_used, status,
-         from_email, to_email, hsn_code) 
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?, 'responded', ?, ?, ?)`,  
-      [
-        batchId,
-        buyer_id || null,
-        sellerId,
-        companyName || null,
-        country || null,
-        contactName || null,
-        email,
-        response,
-        productName || null,
-        templateUsed || 'Manual Response',
-        email,        
-        yourEmail,
-        hsn_code || null  
-      ]
+      `UPDATE email_history_companies
+       SET response = ?, responded_at = NOW(), status = 'responded'
+       WHERE buyer_id = ? AND seller_id = ?
+       ORDER BY id DESC LIMIT 1`,
+      [response, buyerId, seller_id]
     );
-
-    console.log('✅ New response stored:', {
-      id: result.insertId,
-      batchId,
-      seller_id: sellerId,
-      buyer_id: buyer_id,
-      email,
-      response,
-      hsn_code: hsn_code || null, 
-      from_email: email,
-      to_email: yourEmail,
-      timestamp: new Date().toISOString()
-    });
-
-    res.status(200).json({
-      success: true,
-      message: `${response === 'interested' ? 'Interested' : 'Not Interested'} response recorded successfully`,
-      data: {
-        id: result.insertId,
-        batchId: batchId,
-        seller_id: sellerId,
-        buyer_id: buyer_id,
-        email: email,
-        response: response,
-        hsn_code: hsn_code || null,  
-        from_email: email,
-        to_email: yourEmail,
-        respondedAt: new Date().toISOString()
-      }
-    });
-
-  } catch (error) {
-    console.error('Error storing response:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: error.message 
-    });
+    res.json({ success:true, updated: result.affectedRows });
+  } catch (e) {
+    res.status(500).json({ success:false, error: e.message });
   }
 });
+
+
+// // Store response endpoint
+// router.post('/api/store-response', async (req, res) => {
+//   const pool = req.app.get('pool');
+//   const { 
+//     email, 
+//     response, 
+//     companyName, 
+//     country, 
+//     contactName, 
+//     productName,
+//     templateUsed,
+//     buyer_id,
+//     seller_id,
+//     hsn_code  
+//   } = req.body;
+
+//   // Validation
+//   if (!email || !response || !['interested', 'not_interested'].includes(response)) {
+//     return res.status(400).json({ 
+//       success: false, 
+//       error: 'Email and valid response (interested/not_interested) are required' 
+//     });
+//   }
+
+//   try {
+//     const batchId = generateUUID();
+//     const yourEmail = process.env.EMAIL_USER;
+    
+//     const sellerId = seller_id || null;
+    
+//     const [result] = await pool.query(
+//       `INSERT INTO email_history_companies 
+//         (batch_id, buyer_id, seller_id, company_name, country, contact_name, email, 
+//          response, responded_at, product_name, template_used, status,
+//          from_email, to_email, hsn_code) 
+//        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?, 'responded', ?, ?, ?)`,  
+//       [
+//         batchId,
+//         buyer_id || null,
+//         sellerId,
+//         companyName || null,
+//         country || null,
+//         contactName || null,
+//         email,
+//         response,
+//         productName || null,
+//         templateUsed || 'Manual Response',
+//         email,        
+//         yourEmail,
+//         hsn_code || null  
+//       ]
+//     );
+
+//     console.log('✅ New response stored:', {
+//       id: result.insertId,
+//       batchId,
+//       seller_id: sellerId,
+//       buyer_id: buyer_id,
+//       email,
+//       response,
+//       hsn_code: hsn_code || null, 
+//       from_email: email,
+//       to_email: yourEmail,
+//       timestamp: new Date().toISOString()
+//     });
+
+//     res.status(200).json({
+//       success: true,
+//       message: `${response === 'interested' ? 'Interested' : 'Not Interested'} response recorded successfully`,
+//       data: {
+//         id: result.insertId,
+//         batchId: batchId,
+//         seller_id: sellerId,
+//         buyer_id: buyer_id,
+//         email: email,
+//         response: response,
+//         hsn_code: hsn_code || null,  
+//         from_email: email,
+//         to_email: yourEmail,
+//         respondedAt: new Date().toISOString()
+//       }
+//     });
+
+//   } catch (error) {
+//     console.error('Error storing response:', error);
+//     res.status(500).json({ 
+//       success: false, 
+//       error: error.message 
+//     });
+//   }
+// });
 
 // Reveal contact endpoint
 // router.post('/buyers/:id/reveal-contact', async (req, res) => {
